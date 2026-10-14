@@ -577,6 +577,7 @@ with gr.Blocks(
                 "af_sarah",
                 "am_adam",
                 "am_michael",
+                "am_echo",
             ],
             value=DEFAULT_VOICE,
             allow_custom_value=True,
