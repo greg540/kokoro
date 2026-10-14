@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -9,8 +10,11 @@ import soundfile as sf
 from kokoro import KPipeline
 
 # Defaults can be overridden with environment variables before launch.
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
+# Ollama's native API is used for streaming responses and think=False.
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL", "http://localhost:11434/v1"
+).rstrip("/")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:0.8b")
 DEFAULT_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 KOKORO_LANG = os.getenv("KOKORO_LANG", "a")  # a = American English
 SAMPLE_RATE = 24000
@@ -18,59 +22,119 @@ SAMPLE_RATE = 24000
 _kokoro_pipeline = None
 
 
+def ollama_native_base_url():
+    """Convert http://localhost:11434/v1 to http://localhost:11434."""
+    base_url = OLLAMA_BASE_URL.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return base_url
+
+
 def get_kokoro_pipeline():
-    """Initialize Kokoro on the first request, not while the UI is starting."""
+    """Initialize Kokoro on the first speech request."""
     global _kokoro_pipeline
     if _kokoro_pipeline is None:
         _kokoro_pipeline = KPipeline(lang_code=KOKORO_LANG)
     return _kokoro_pipeline
 
 
-def call_ollama(user_text, history, system_prompt, model_name):
-    model_name = (model_name or DEFAULT_MODEL).strip()
-    if not model_name:
-        raise gr.Error("Enter a model name shown by `ollama list`.")
+def build_messages(user_text, history, system_prompt):
+    """Build a short request using only a few recent conversation messages."""
+    prompt = (system_prompt or "").strip()
+    if not prompt:
+        prompt = (
+            "You are a friendly, natural voice assistant. "
+            "Reply in one or two short sentences, usually under 25 words. "
+            "Do not show reasoning, markdown, or bullet points."
+        )
 
-    messages = [{
-        "role": "system",
-        "content": (system_prompt or "You are a helpful voice assistant. Keep answers concise and natural when spoken aloud.").strip(),
-    }]
+    messages = [{"role": "system", "content": prompt}]
 
-    # Keep up to the last 10 conversation messages to preserve context without
-    # sending the entire conversation indefinitely.
-    for item in (history or [])[-10:]:
-        if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
-            content = item.get("content", "")
-            if isinstance(content, str) and content.strip():
-                messages.append({"role": item["role"], "content": content})
+    # Chat history is stored as Gradio messages. Keep the last 6 messages
+    # (usually 3 user/assistant turns) to reduce prompt-processing overhead.
+    for item in (history or [])[-6:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content", "")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            messages.append({"role": role, "content": content})
 
     messages.append({"role": "user", "content": user_text})
-    url = f"{OLLAMA_BASE_URL}/chat/completions"
+    return messages
+
+
+def stream_ollama_reply(user_text, history, system_prompt, model_name):
+    """Yield the complete response so far as Ollama sends streamed chunks."""
+    model_name = (model_name or DEFAULT_MODEL).strip()
+    if not model_name:
+        raise RuntimeError("Enter a model name shown by `ollama list`.")
+
+    url = f"{ollama_native_base_url()}/api/chat"
     payload = {
         "model": model_name,
-        "messages": messages,
-        "temperature": 0.7,
-        "stream": False,
+        "messages": build_messages(user_text, history, system_prompt),
+        "think": False,
+        "stream": True,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.5,
+            "num_predict": 60,
+            "num_ctx": 2048,
+        },
     }
+
+    accumulated = ""
     try:
-        response = requests.post(url, json=payload, timeout=(10, 300))
-        response.raise_for_status()
-        data = response.json()
-        reply = data["choices"][0]["message"]["content"].strip()
-        if not reply:
-            raise RuntimeError("Ollama returned an empty response.")
-        return reply, model_name
+        with requests.post(
+            url,
+            json=payload,
+            stream=True,
+            timeout=(10, 120),
+        ) as response:
+            if not response.ok:
+                error_body = response.text[:1000]
+                raise RuntimeError(
+                    f"Ollama API returned HTTP {response.status_code}: {error_body}"
+                )
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+
+                if chunk.get("error"):
+                    raise RuntimeError(chunk["error"])
+
+                message = chunk.get("message", {})
+                content = message.get("content", "") if isinstance(message, dict) else ""
+                if content:
+                    accumulated += content
+                    yield accumulated
+
+                if chunk.get("done"):
+                    break
+
     except requests.exceptions.ConnectionError as exc:
-        raise gr.Error(
-            f"Can't connect to Ollama at {OLLAMA_BASE_URL}. Start Ollama and try again."
+        raise RuntimeError(
+            f"Can't connect to Ollama at {ollama_native_base_url()}. "
+            "Make sure Ollama is running."
         ) from exc
     except requests.exceptions.Timeout as exc:
-        raise gr.Error("Ollama took too long to respond. Check that the model is running.") from exc
-    except requests.exceptions.HTTPError as exc:
-        body = response.text[:1000] if "response" in locals() else str(exc)
-        raise gr.Error(f"Ollama API returned an error ({exc}).\n{body}") from exc
-    except (KeyError, ValueError, TypeError) as exc:
-        raise gr.Error(f"Couldn't read Ollama's response: {exc}") from exc
+        raise RuntimeError(
+            "Ollama timed out. Check that the model is loaded and responding."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Ollama request failed: {exc}") from exc
+
+    if not accumulated.strip():
+        raise RuntimeError(
+            "Ollama returned no visible text. Check that the selected model is installed "
+            "and supports the requested API options."
+        )
 
 
 def make_speech(text, voice):
@@ -78,47 +142,93 @@ def make_speech(text, voice):
     voice = (voice or DEFAULT_VOICE).strip()
     pipeline = get_kokoro_pipeline()
     chunks = []
+
     try:
         for _graphemes, _phonemes, audio in pipeline(text, voice=voice, speed=1.0):
             if audio is None:
                 continue
-            # Kokoro normally yields torch tensors; explicitly move to CPU
-            # before converting so this also works if its pipeline uses CUDA.
+            # Kokoro normally yields torch tensors; move to CPU before conversion.
             if hasattr(audio, "detach"):
                 audio = audio.detach().cpu().numpy()
             chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
     except Exception as exc:
-        raise gr.Error(
-            f"Kokoro speech generation failed: {exc}\n"
-            "Check that espeak-ng is installed and that the selected voice matches the language."
+        raise RuntimeError(
+            f"Kokoro speech generation failed: {exc}. Check eSpeak NG and the selected voice."
         ) from exc
 
     if not chunks:
-        raise gr.Error("Kokoro did not return any audio. Try a shorter response or another voice.")
+        raise RuntimeError(
+            "Kokoro did not return any audio. Try a shorter response or another voice."
+        )
 
     waveform = np.concatenate(chunks)
     temp_dir = Path(tempfile.gettempdir()) / "local_voice_ai_text"
     temp_dir.mkdir(parents=True, exist_ok=True)
-    fd, output_path = tempfile.mkstemp(prefix="kokoro_reply_", suffix=".wav", dir=temp_dir)
+    fd, output_path = tempfile.mkstemp(
+        prefix="kokoro_reply_", suffix=".wav", dir=temp_dir
+    )
     os.close(fd)
     sf.write(output_path, waveform, SAMPLE_RATE)
     return output_path
 
 
 def send_message(user_text, history, system_prompt, model_name, voice):
+    """Stream the text into the chat, then generate and attach Kokoro audio."""
     user_text = (user_text or "").strip()
-    history = history or []
+    history = list(history or [])
     if not user_text:
-        return "", history, None, "Enter a message first."
+        yield "", history, None, "Enter a message first."
+        return
 
-    reply, actual_model = call_ollama(user_text, history, system_prompt, model_name)
+    actual_model = (model_name or DEFAULT_MODEL).strip()
     updated_history = history + [
         {"role": "user", "content": user_text},
-        {"role": "assistant", "content": reply},
+        {"role": "assistant", "content": ""},
     ]
-    audio_path = make_speech(reply, voice)
-    status = f"Reply generated locally with `{actual_model}` and spoken using Kokoro voice `{voice}`."
-    return "", updated_history, audio_path, status
+
+    # Show the user's message immediately while Ollama starts responding.
+    yield "", updated_history, None, f"Waiting for `{actual_model}` to respond..."
+
+    reply = ""
+    try:
+        for partial_reply in stream_ollama_reply(
+            user_text, history, system_prompt, actual_model
+        ):
+            reply = partial_reply
+            updated_history[-1] = {"role": "assistant", "content": reply}
+            yield "", updated_history, None, f"Receiving response from `{actual_model}`..."
+    except Exception as exc:
+        error_text = str(exc)
+        updated_history[-1] = {
+            "role": "assistant",
+            "content": f"Ollama error: {error_text}",
+        }
+        yield "", updated_history, None, f"**Ollama error:** {error_text}"
+        return
+
+    # Important: display the complete text before generating the audio.
+    yield (
+        "",
+        updated_history,
+        None,
+        f"Text ready from `{actual_model}`. Generating speech with Kokoro...",
+    )
+
+    try:
+        audio_path = make_speech(reply, voice)
+        yield (
+            "",
+            updated_history,
+            audio_path,
+            f"Reply generated with `{actual_model}` and spoken using Kokoro voice `{voice}`.",
+        )
+    except Exception as exc:
+        yield (
+            "",
+            updated_history,
+            None,
+            f"Text reply is ready, but Kokoro could not generate audio: {exc}",
+        )
 
 
 def clear_conversation():
@@ -127,30 +237,41 @@ def clear_conversation():
 
 def test_ollama(model_name):
     model_name = (model_name or DEFAULT_MODEL).strip()
+    url = f"{ollama_native_base_url()}/api/tags"
     try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/models", timeout=5)
+        response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
-        models = [item.get("id", "") for item in data.get("data", [])]
+        models = [item.get("name", "") for item in data.get("models", [])]
         if models and model_name not in models:
-            return f"Ollama is reachable, but `{model_name}` wasn't listed. Available models: " + ", ".join(models)
-        return f"Ollama is reachable at `{OLLAMA_BASE_URL}`. Selected model: `{model_name}`."
+            return (
+                f"Ollama is reachable, but `{model_name}` wasn't listed. Available models: `"
+                + "`, `".join(models)
+                + "`"
+            )
+        if not models:
+            return f"Ollama is reachable at `{url}`, but it returned no installed models."
+        return f"Ollama is reachable. Selected model: `{model_name}`."
     except Exception as exc:
-        return f"Couldn't reach Ollama at `{OLLAMA_BASE_URL}`: {exc}"
+        return f"Couldn't reach Ollama at `{url}`: {exc}"
 
 
 with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         "# Local AI Text + Voice Test\n"
-        "Type a message, get a response from your local Ollama model, then hear the response spoken by Kokoro.\n\n"
-        "**No microphone or Vonage connection is used in this version.**"
+        "Type a message, receive a streamed response from your local Ollama model, "
+        "then hear the completed response spoken by Kokoro.\n\n"
+        "**Text input only. No microphone or Vonage connection is used.**"
     )
 
     with gr.Row():
         model_box = gr.Textbox(label="Ollama model", value=DEFAULT_MODEL, scale=2)
         voice_box = gr.Dropdown(
             label="Kokoro voice",
-            choices=["af_heart", "af_bella", "af_nicole", "af_sarah", "am_adam", "am_michael"],
+            choices=[
+                "af_heart", "af_bella", "af_nicole", "af_sarah",
+                "am_adam", "am_michael",
+            ],
             value=DEFAULT_VOICE,
             allow_custom_value=True,
             scale=1,
@@ -158,13 +279,20 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as de
 
     with gr.Row():
         check_button = gr.Button("Test Ollama connection")
-        connection_status = gr.Markdown("Ollama endpoint: `" + OLLAMA_BASE_URL + "`")
+        connection_status = gr.Markdown(
+            "Ollama endpoint: `" + f"{ollama_native_base_url()}/api/chat" + "`"
+        )
 
     system_box = gr.Textbox(
         label="System instructions",
-        value="You are a helpful voice assistant. Keep answers concise, conversational, and easy to understand when spoken aloud.",
-        lines=2,
+        value=(
+            "You are a friendly, natural conversational assistant. "
+            "Reply in one or two short sentences, usually under 25 words. "
+            "Do not show reasoning, markdown, or bullet points. Ask one question at a time."
+        ),
+        lines=3,
     )
+
     chat = gr.Chatbot(label="Conversation", type="messages", height=380)
     with gr.Row():
         message_box = gr.Textbox(
@@ -186,6 +314,12 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as de
     clear_button.click(clear_conversation, inputs=[], outputs=outputs)
     check_button.click(test_ollama, inputs=[model_box], outputs=[connection_status])
 
+
 if __name__ == "__main__":
-    # Bind only to the local machine; this is not exposed to your network.
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, share=False)
+    # Bind only to the local machine; do not expose this UI to your network.
+    demo.queue().launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        inbrowser=True,
+        share=False,
+    )
