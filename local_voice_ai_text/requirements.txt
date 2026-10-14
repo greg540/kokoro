@@ -1,0 +1,5 @@
+gradio>=5.20,<6
+requests>=2.31
+numpy>=1.26
+soundfile>=0.12
+kokoro>=0.9.4
