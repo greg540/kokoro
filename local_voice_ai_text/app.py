@@ -6,6 +6,7 @@ import threading
 import time
 import unicodedata
 import queue
+from collections import deque
 from pathlib import Path
 
 import gradio as gr
@@ -30,6 +31,11 @@ VAD_START_FRAMES = int(os.getenv("VAD_START_FRAMES", "6"))
 VAD_END_SILENCE_SECONDS = float(os.getenv("VAD_END_SILENCE_SECONDS", "0.70"))
 VAD_MIN_UTTERANCE_SECONDS = float(os.getenv("VAD_MIN_UTTERANCE_SECONDS", "0.30"))
 
+MAX_EVENTS = 5000          # events retained in memory (oldest dropped first)
+LIVE_LOG_LINES = 300       # lines shown in the live log view
+NOISE_LOG_MIN_FRAMES = 2   # ignored noise bursts shorter than this are not logged
+NOISE_LOG_INTERVAL = 0.5   # seconds between "noise ignored" log lines
+
 TEMP_DIR = Path(tempfile.gettempdir()) / "local_voice_ai_text"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -49,6 +55,7 @@ _model_lock = threading.Lock()
 _audio_running = threading.Event()
 _interrupt_playback = threading.Event()
 _cancel_response = threading.Event()
+_bot_active = threading.Event()  # set while the bot is generating / synthesizing / speaking
 _audio_queue = queue.Queue(maxsize=120)
 _turn_queue = queue.Queue(maxsize=8)
 _audio_stream = None
@@ -63,8 +70,194 @@ _voice_name = DEFAULT_VOICE
 _voice_system_prompt = DEFAULT_SYSTEM_PROMPT
 _voice_history = []
 _voice_status = "Voice mode stopped."
+_input_device_name = "-"
+_output_device_name = "-"
+
+# ---------------- Event log (transcript + diagnostics) ----------------
+# kinds: CALLER (caller speech), BOT (bot replies), SYSTEM (debug/info),
+#        BARGE (barge-in diagnostics), ERROR (mic / Whisper / Ollama / Kokoro / playback errors)
+_events = []
+_events_lock = threading.Lock()
+
+# Rolling input-level history (one RMS value per ~21 ms audio block) for the live meter.
+_level_history = deque(maxlen=300)
+
+# Live audio metrics, written by the monitor thread and read by the UI.
+_metrics = {
+    "rms_now": 0.0,
+    "rms_peak_recent": 0.0,
+    "rms_peak_session": 0.0,
+    "noise_floor": 0.0,
+    "speech_active": False,
+    "frames_over": 0,
+    "blocks_dropped": 0,
+    "mic_status": "",
+    "utterances": 0,
+}
 
 
+def log_event(kind, text, source="voice"):
+    with _events_lock:
+        _events.append({"time": time.time(), "kind": kind, "source": source, "text": str(text)})
+        if len(_events) > MAX_EVENTS:
+            del _events[: len(_events) - MAX_EVENTS]
+
+
+def format_event(event, include_kind=True):
+    t = event["time"]
+    stamp = time.strftime("%H:%M:%S", time.localtime(t)) + f".{int(t * 1000) % 1000:03d}"
+    kind = event["kind"]
+    if event["source"] == "text" and kind in ("CALLER", "BOT"):
+        kind = f"{kind} (text)"
+    return f"[{stamp}] {kind}: {event['text']}" if include_kind else f"[{stamp}] {event['text']}"
+
+
+def snapshot_events(kinds=None, limit=None):
+    with _events_lock:
+        items = [e for e in _events if kinds is None or e["kind"] in kinds]
+    if limit:
+        items = items[-limit:]
+    return items
+
+
+def transcript_text():
+    """Full conversation only: every caller utterance and bot reply, in order."""
+    return "\n".join(format_event(e) for e in snapshot_events({"CALLER", "BOT"}))
+
+
+def live_log_text():
+    """Everything (conversation + system + barge-in + errors) as it happens."""
+    return "\n".join(format_event(e) for e in snapshot_events(limit=LIVE_LOG_LINES))
+
+
+def barge_log_text():
+    return "\n".join(format_event(e, include_kind=False) for e in snapshot_events({"BARGE"}, limit=200))
+
+
+def error_log_text():
+    return "\n".join(format_event(e, include_kind=False) for e in snapshot_events({"ERROR"}, limit=200))
+
+
+def audio_diagnostics_text():
+    m = dict(_metrics)
+    running = _audio_running.is_set()
+    floor = m["noise_floor"]
+    suggested = max(0.005, min(0.08, floor * 3.0)) if floor > 0 else None
+    lines = [
+        f"Voice mode:            {'RUNNING' if running else 'stopped'}",
+        f"Input device:          {_input_device_name}  ({_input_sample_rate} Hz)",
+        f"Output device:         {_output_device_name}",
+        f"Current level (RMS):   {m['rms_now']:.4f}   {'#' * min(40, int(m['rms_now'] * 400))}",
+        f"Recent peak:           {m['rms_peak_recent']:.4f}",
+        f"Session peak:          {m['rms_peak_session']:.4f}",
+        f"Noise floor (est.):    {floor:.4f}" + (f"   (suggested threshold ≈ {suggested:.4f})" if suggested else ""),
+        f"Barge-in threshold:    {VAD_RMS_THRESHOLD:.4f}",
+        f"Confirmation frames:   {VAD_START_FRAMES}   (currently {m['frames_over']} consecutive above threshold)",
+        f"Caller speaking now:   {'yes' if m['speech_active'] else 'no'}",
+        f"Bot active:            {'yes' if _bot_active.is_set() else 'no'}",
+        f"Utterances captured:   {m['utterances']}",
+        f"Audio blocks dropped:  {m['blocks_dropped']}",
+        f"Last mic status:       {m['mic_status'] or 'OK'}",
+    ]
+    return "\n".join(lines)
+
+
+def render_level_meter(threshold=None):
+    """Rolling input-volume graph with the barge-in threshold drawn over it."""
+    try:
+        thr = float(threshold) if threshold is not None else VAD_RMS_THRESHOLD
+    except (TypeError, ValueError):
+        thr = VAD_RMS_THRESHOLD
+    levels = list(_level_history)
+    n = _level_history.maxlen
+    W, H = 1000, 200
+    peak = max(levels) if levels else 0.0
+    ymax = max(0.10, thr * 1.5, peak * 1.15)
+    bw = W / n
+    offset = n - len(levels)
+    bars = []
+    for i, v in enumerate(levels):
+        h = min(H, v / ymax * H)
+        color = "#c9605f" if v >= thr else "#4a9d78"
+        bars.append(
+            f'<rect x="{(offset + i) * bw:.2f}" y="{H - h:.2f}" width="{bw + 0.3:.2f}" height="{h:.2f}" fill="{color}"/>'
+        )
+    ty = H - thr / ymax * H
+    ty_pct = ty / H * 100.0
+    now = levels[-1] if levels else 0.0
+    state = "ABOVE threshold" if now >= thr else "below threshold"
+    state_color = "#c9605f" if now >= thr else "#4a9d78"
+    return (
+        '<div style="font-family:monospace;font-size:13px;margin-bottom:4px;">'
+        f'Input level: <b>{now:.4f}</b> &nbsp;|&nbsp; Barge-in threshold: <b>{thr:.4f}</b> &nbsp;|&nbsp; '
+        f'<b style="color:{state_color}">{state}</b> '
+        '&nbsp;<span style="opacity:.7">(green = below, red = above; last ~6 s)</span></div>'
+        '<div style="position:relative;width:100%;height:200px;background:rgba(127,127,127,.12);'
+        'border:1px solid rgba(127,127,127,.35);border-radius:6px;overflow:hidden;">'
+        f'<svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" width="100%" height="100%" '
+        'xmlns="http://www.w3.org/2000/svg" style="display:block;">'
+        + "".join(bars)
+        + f'<line x1="0" x2="{W}" y1="{ty:.2f}" y2="{ty:.2f}" stroke="#f5a623" stroke-width="2" '
+        'stroke-dasharray="8 5" vector-effect="non-scaling-stroke"/>'
+        '</svg>'
+        f'<span style="position:absolute;right:6px;top:calc({ty_pct:.2f}% - 18px);font-family:monospace;'
+        'font-size:12px;font-weight:bold;color:#f5a623;background:rgba(0,0,0,.55);padding:0 5px;'
+        f'border-radius:3px;">threshold {thr:.4f}</span>'
+        f'<span style="position:absolute;left:6px;top:4px;font-family:monospace;font-size:11px;opacity:.7;">'
+        f'{ymax:.3f}</span>'
+        '<span style="position:absolute;left:6px;bottom:4px;font-family:monospace;font-size:11px;opacity:.7;">0</span>'
+        '</div>'
+    )
+
+
+def apply_live_settings(threshold, frames):
+    """Apply slider changes immediately so the threshold can be tuned while listening."""
+    global VAD_RMS_THRESHOLD, VAD_START_FRAMES
+    VAD_RMS_THRESHOLD = float(threshold)
+    VAD_START_FRAMES = int(frames)
+    log_event("SYSTEM", f"Settings changed live: threshold {VAD_RMS_THRESHOLD:.4f}, confirmation frames {VAD_START_FRAMES}.")
+
+
+def refresh_views():
+    return audio_diagnostics_text(), transcript_text(), live_log_text(), barge_log_text(), error_log_text(), get_voice_status()
+
+
+def clear_logs():
+    with _events_lock:
+        _events.clear()
+    _metrics.update(rms_peak_session=0.0, rms_peak_recent=0.0, utterances=0, blocks_dropped=0, mic_status="")
+    log_event("SYSTEM", "Logs cleared.")
+    return refresh_views()[1:5]
+
+
+def export_transcript():
+    """Write a troubleshooting file: settings, transcript, full event log, errors."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = TEMP_DIR / f"conversation_{stamp}.txt"
+    sections = [
+        "LOCAL VOICE AI — CONVERSATION EXPORT",
+        f"Exported:   {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Model:      {_voice_model}",
+        f"Voice:      {_voice_name}",
+        f"Input:      {_input_device_name} ({_input_sample_rate} Hz)",
+        f"Output:     {_output_device_name}",
+        f"Threshold:  {VAD_RMS_THRESHOLD:.4f}   Confirmation frames: {VAD_START_FRAMES}",
+        "",
+        "=== TRANSCRIPT (caller + bot) ===",
+        transcript_text() or "(empty)",
+        "",
+        "=== FULL EVENT LOG (conversation, system, barge-in, errors) ===",
+        "\n".join(format_event(e) for e in snapshot_events()) or "(empty)",
+        "",
+        "=== ERRORS ===",
+        error_log_text() or "(none)",
+        "",
+    ]
+    path.write_text("\n".join(sections), encoding="utf-8")
+    return str(path)
+
+
+# ---------------- LLM / speech helpers ----------------
 def ollama_native_base_url():
     return OLLAMA_BASE_URL[:-3] if OLLAMA_BASE_URL.endswith("/v1") else OLLAMA_BASE_URL
 
@@ -246,30 +439,39 @@ def play_audio_interruptibly(path):
     """Play small blocks so a confirmed customer interruption can stop output quickly."""
     if _output_device_index is None or not _audio_running.is_set():
         return
-    audio, rate = sf.read(path, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    block = max(1, int(rate * 0.025))  # about 25 ms per block
-    _interrupt_playback.clear()
     try:
+        audio, rate = sf.read(path, dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        block = max(1, int(rate * 0.025))  # about 25 ms per block
+        _interrupt_playback.clear()
+        total = len(audio)
         with sd.OutputStream(
             device=_output_device_index, samplerate=rate, channels=1, dtype="float32", latency="low"
         ) as stream:
-            for start in range(0, len(audio), block):
+            for start in range(0, total, block):
                 if not _audio_running.is_set() or _interrupt_playback.is_set():
-                    break
+                    pct = int(100 * start / max(1, total))
+                    log_event("SYSTEM", f"Playback stopped early at {pct}% of the bot's audio.")
+                    return
                 stream.write(audio[start:start + block])
+        log_event("SYSTEM", "Playback finished normally.")
     except Exception as exc:
         set_voice_status(f"Audio playback error: {exc}")
+        log_event("ERROR", f"Audio playback error (output device): {exc}")
 
 
 def audio_input_callback(indata, frames, time_info, status):
     if not _audio_running.is_set():
         return
+    if status:
+        # Keep the callback light; the monitor thread logs this.
+        _metrics["mic_status"] = str(status)
     block = np.asarray(indata[:, 0], dtype=np.float32).copy()
     try:
         _audio_queue.put_nowait(block)
     except queue.Full:
+        _metrics["blocks_dropped"] += 1
         try:
             _audio_queue.get_nowait()
             _audio_queue.put_nowait(block)
@@ -285,6 +487,10 @@ def monitor_audio_loop():
     speech_active = False
     consecutive_voice = 0
     silence_frames = 0
+    burst_peak = 0.0
+    last_noise_log = 0.0
+    last_mic_status_logged = ""
+    last_peak_decay = time.time()
     block_seconds = 1024 / float(_input_sample_rate)
     end_silence_frames = max(1, int(VAD_END_SILENCE_SECONDS / block_seconds))
 
@@ -297,19 +503,67 @@ def monitor_audio_loop():
             continue
         rms = float(np.sqrt(np.mean(np.square(block, dtype=np.float64)) + 1e-12))
         voiced = rms >= VAD_RMS_THRESHOLD
+        now = time.time()
+
+        # ---- live metrics ----
+        _metrics["rms_now"] = rms
+        _level_history.append(rms)
+        _metrics["rms_peak_session"] = max(_metrics["rms_peak_session"], rms)
+        if now - last_peak_decay > 2.0:
+            _metrics["rms_peak_recent"] = 0.0
+            last_peak_decay = now
+        _metrics["rms_peak_recent"] = max(_metrics["rms_peak_recent"], rms)
+        if not voiced and not speech_active:
+            floor = _metrics["noise_floor"]
+            _metrics["noise_floor"] = rms if floor == 0.0 else 0.98 * floor + 0.02 * rms
+        mic_status = _metrics["mic_status"]
+        if mic_status and mic_status != last_mic_status_logged:
+            log_event("ERROR", f"Microphone stream status: {mic_status}")
+            last_mic_status_logged = mic_status
 
         if not speech_active:
             pre_roll.append(block)
             if len(pre_roll) > 8:
                 pre_roll.pop(0)
-            consecutive_voice = consecutive_voice + 1 if voiced else 0
+            if voiced:
+                consecutive_voice += 1
+                burst_peak = max(burst_peak, rms)
+            else:
+                # A short burst that never reached the confirmation count = background noise.
+                if consecutive_voice >= NOISE_LOG_MIN_FRAMES and now - last_noise_log > NOISE_LOG_INTERVAL:
+                    log_event(
+                        "BARGE",
+                        f"Noise ignored: {consecutive_voice} frame(s) above threshold, needs "
+                        f"{VAD_START_FRAMES} (peak RMS {burst_peak:.4f}, threshold {VAD_RMS_THRESHOLD:.4f}).",
+                    )
+                    last_noise_log = now
+                consecutive_voice = 0
+                burst_peak = 0.0
+            _metrics["frames_over"] = consecutive_voice
+
             if consecutive_voice >= VAD_START_FRAMES:
                 speech_active = True
+                _metrics["speech_active"] = True
                 speech_chunks = list(pre_roll)
                 pre_roll.clear()
                 silence_frames = 0
+                bot_was_active = _bot_active.is_set()
+                if bot_was_active:
+                    log_event(
+                        "BARGE",
+                        f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
+                        f"(peak RMS {burst_peak:.4f}). Bot was active -> playback interrupted and "
+                        "in-flight reply cancelled.",
+                    )
+                else:
+                    log_event(
+                        "BARGE",
+                        f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
+                        f"(peak RMS {burst_peak:.4f}). Bot idle -> nothing to interrupt.",
+                    )
                 stop_playback()  # Barge-in: stop speech and cancel any in-flight reply.
                 set_voice_status("Customer speaking — AI audio interrupted.")
+                burst_peak = 0.0
             continue
 
         speech_chunks.append(block)
@@ -318,20 +572,29 @@ def monitor_audio_loop():
             utterance = speech_chunks
             speech_chunks = []
             speech_active = False
+            _metrics["speech_active"] = False
             consecutive_voice = 0
             silence_frames = 0
             pre_roll = []
             duration = sum(len(part) for part in utterance) / float(_input_sample_rate)
             if duration >= VAD_MIN_UTTERANCE_SECONDS:
+                _metrics["utterances"] += 1
+                log_event("SYSTEM", f"Caller utterance captured ({duration:.2f}s); queued for transcription.")
                 try:
                     _turn_queue.put_nowait(utterance)
                 except queue.Full:
+                    log_event("SYSTEM", "Turn queue full; dropped the oldest utterance.")
                     # Keep the newest utterance if the worker is backed up.
                     try:
                         _turn_queue.get_nowait()
                         _turn_queue.put_nowait(utterance)
                     except (queue.Empty, queue.Full):
                         pass
+            else:
+                log_event(
+                    "BARGE",
+                    f"Utterance discarded: {duration:.2f}s is shorter than {VAD_MIN_UTTERANCE_SECONDS:.2f}s minimum.",
+                )
 
 
 def customer_turn_worker():
@@ -349,13 +612,20 @@ def customer_turn_worker():
         _interrupt_playback.clear()
         _cancel_response.clear()
         audio = np.concatenate(utterance)
+        stage = "transcription (Whisper)"
+        _bot_active.set()
         try:
             set_voice_status("Transcribing customer...")
+            t0 = time.time()
             transcript = transcribe_audio(audio, _input_sample_rate)
+            log_event("SYSTEM", f"Whisper finished in {time.time() - t0:.2f}s.")
             if not transcript:
+                log_event("SYSTEM", "Whisper returned no text (silence or noise); no reply generated.")
                 set_voice_status("Listening for customer...")
+                _bot_active.clear()
                 continue
 
+            log_event("CALLER", transcript)
             with _state_lock:
                 # The latest transcript becomes the new user turn.
                 _voice_history.append({"role": "user", "content": transcript})
@@ -363,37 +633,56 @@ def customer_turn_worker():
                 model, voice, prompt = _voice_model, _voice_name, _voice_system_prompt
             set_voice_status(f"Customer: {transcript}")
 
+            stage = "Ollama"
             answer = ""
+            t0 = time.time()
             for partial in stream_ollama_reply(history, transcript, model, prompt, _cancel_response):
                 if _cancel_response.is_set() or not _audio_running.is_set():
                     break
                 answer = partial
             if _cancel_response.is_set() or not _audio_running.is_set():
+                log_event("SYSTEM", "Reply generation cancelled because the caller spoke.")
                 set_voice_status("Customer interrupted; listening for the next utterance.")
+                _bot_active.clear()
                 continue
+            log_event("SYSTEM", f"Ollama finished in {time.time() - t0:.2f}s (model {model}).")
 
             answer = ensure_natural_opener(answer)
             if not answer:
+                log_event("ERROR", "Ollama returned an empty response.")
                 set_voice_status("Ollama returned an empty response; listening.")
+                _bot_active.clear()
                 continue
             with _state_lock:
                 _voice_history.append({"role": "assistant", "content": answer})
+            log_event("BOT", answer)
             set_voice_status(f"Speaking: {answer}")
+
+            stage = "text-to-speech (Kokoro)"
+            t0 = time.time()
             speech_path = make_speech(answer, voice)
+            log_event("SYSTEM", f"Kokoro synthesized audio in {time.time() - t0:.2f}s.")
             # Do not clear an interrupt that arrived during synthesis.
             if not _interrupt_playback.is_set() and _audio_running.is_set():
+                stage = "playback"
                 play_audio_interruptibly(speech_path)
+            else:
+                log_event("SYSTEM", "Skipped playback: caller spoke during synthesis.")
             set_voice_status("Listening for customer...")
         except requests.RequestException as exc:
             set_voice_status(f"Ollama connection error: {exc}")
+            log_event("ERROR", f"Ollama connection error: {exc}")
         except Exception as exc:
-            set_voice_status(f"Voice pipeline error: {exc}")
+            set_voice_status(f"Voice pipeline error ({stage}): {exc}")
+            log_event("ERROR", f"Pipeline error during {stage}: {exc}")
+        finally:
+            _bot_active.clear()
 
 
 def start_voice_mode(input_label, output_label, model, voice, system_prompt, barge_threshold, confirmation_frames):
     global _audio_stream, _monitor_thread, _turn_thread, _input_device_index, _output_device_index
     global _input_sample_rate, _voice_model, _voice_name, _voice_system_prompt, _voice_history
-    global VAD_RMS_THRESHOLD, VAD_START_FRAMES
+    global VAD_RMS_THRESHOLD, VAD_START_FRAMES, _input_device_name, _output_device_name
     if _audio_running.is_set():
         return "Voice mode is already running."
     input_index, output_index = parse_device_index(input_label), parse_device_index(output_label)
@@ -407,6 +696,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
         if output_info["max_output_channels"] < 1:
             return "The selected output device has no output channels."
         _input_device_index, _output_device_index = input_index, output_index
+        _input_device_name, _output_device_name = input_info["name"], output_info["name"]
         VAD_RMS_THRESHOLD = float(barge_threshold)
         VAD_START_FRAMES = int(confirmation_frames)
         _input_sample_rate = int(round(input_info.get("default_samplerate", 48000)))
@@ -426,6 +716,18 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
                 break
         _interrupt_playback.clear()
         _cancel_response.clear()
+        _bot_active.clear()
+        _metrics.update(
+            rms_now=0.0, rms_peak_recent=0.0, rms_peak_session=0.0, noise_floor=0.0,
+            speech_active=False, frames_over=0, mic_status="",
+        )
+        log_event("SYSTEM", "=== Voice session started ===")
+        log_event(
+            "SYSTEM",
+            f"Input: {_input_device_name} ({_input_sample_rate} Hz) | Output: {_output_device_name} | "
+            f"Model: {_voice_model} | Voice: {_voice_name}",
+        )
+        log_event("SYSTEM", f"Barge-in threshold {VAD_RMS_THRESHOLD:.4f}, confirmation frames {VAD_START_FRAMES}.")
         _audio_running.set()
         _audio_stream = sd.InputStream(
             device=input_index, samplerate=_input_sample_rate, channels=1,
@@ -443,6 +745,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
         )
     except Exception as exc:
         _audio_running.clear()
+        log_event("ERROR", f"Could not start voice mode (microphone/audio device): {exc}")
         try:
             if _audio_stream:
                 _audio_stream.stop()
@@ -461,9 +764,12 @@ def stop_voice_mode():
         if _audio_stream is not None:
             _audio_stream.stop()
             _audio_stream.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        log_event("ERROR", f"Error closing microphone stream: {exc}")
     _audio_stream = None
+    _bot_active.clear()
+    _metrics["speech_active"] = False
+    log_event("SYSTEM", "=== Voice session stopped ===")
     set_voice_status("Voice mode stopped.")
     return "Voice mode stopped."
 
@@ -476,7 +782,9 @@ def send_message(message, history, model, voice, system_prompt):
         return
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": ""})
+    log_event("CALLER", message, source="text")
     yield "", history, None, "Thinking locally..."
+    stage = "Ollama"
     try:
         answer = ""
         for partial in stream_ollama_reply(history[:-2], message, model, system_prompt):
@@ -485,10 +793,13 @@ def send_message(message, history, model, voice, system_prompt):
             yield "", history, None, "Generating response..."
         answer = ensure_natural_opener(answer)
         history[-1]["content"] = answer
+        log_event("BOT", answer, source="text")
+        stage = "text-to-speech (Kokoro)"
         speech_path = make_speech(answer, voice)
         yield "", history, speech_path, "Response ready."
     except Exception as exc:
         history[-1]["content"] = f"Error: {exc}"
+        log_event("ERROR", f"Text chat error during {stage}: {exc}")
         yield "", history, None, f"Error: {exc}"
 
 
@@ -503,6 +814,7 @@ def test_ollama():
         names = [item.get("name", "") for item in response.json().get("models", [])]
         return "Ollama is reachable. Models: " + (", ".join(names) if names else "(none listed)")
     except Exception as exc:
+        log_event("ERROR", f"Ollama connection test failed: {exc}")
         return f"Ollama connection failed: {exc}"
 
 
@@ -511,11 +823,19 @@ try:
     DEFAULT_INPUT_DEVICE = default_device_label("input", ["voicemeeter aux output", "voice meeter aux output"])
     OUTPUT_CHOICES = INPUT_CHOICES
     DEFAULT_OUTPUT_DEVICE = default_device_label("output", ["voicemeeter input", "voice meeter input"])
-except Exception:
+except Exception as _exc:
     INPUT_CHOICES, OUTPUT_CHOICES = [], []
     DEFAULT_INPUT_DEVICE, DEFAULT_OUTPUT_DEVICE = None, None
+    log_event("ERROR", f"Could not list audio devices: {_exc}")
 
-with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as demo:
+NO_FLASH_CSS = """
+/* Stop Gradio's "updating" pulse/dim effect on auto-refreshing components */
+.pending, .generating, .translucent { opacity: 1 !important; animation: none !important; transition: none !important; }
+.generating { border-color: transparent !important; }
+.wrap.default, .wrap.center.default, .progress-text, .eta-bar { display: none !important; }
+"""
+
+with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=NO_FLASH_CSS) as demo:
     gr.Markdown("# Local Text + Voice AI")
     gr.Markdown(
         "Local Ollama + Kokoro with a continuous VoiceMeeter audio path. For Vonage, the input should "
@@ -533,7 +853,7 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as de
     with gr.Tab("Voice / Vonage"):
         gr.Markdown(
             "**Barge-in enabled:** raise the RMS threshold and/or require more consecutive audio frames "
-            "to prevent background noise from interrupting the AI. Settings apply when you press Start Voice Mode."
+            "to prevent background noise from interrupting the AI. The sliders apply live (when you release them); the graph below shows your input volume with the threshold line, so you can tune it while watching."
         )
         with gr.Row():
             input_device_box = gr.Dropdown(label="Customer audio input", choices=INPUT_CHOICES, value=DEFAULT_INPUT_DEVICE, allow_custom_value=True)
@@ -551,12 +871,64 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft()) as de
             start_voice_button = gr.Button("Start Voice Mode", variant="primary")
             stop_voice_button = gr.Button("Stop Voice Mode")
         voice_status = gr.Textbox(label="Voice status", value="Voice mode stopped.", interactive=False)
+
+        level_meter = gr.HTML(value=render_level_meter(), label="Input volume vs. barge-in threshold")
+
+        audio_diag_box = gr.Textbox(
+            label="Audio troubleshooting (live)", value=audio_diagnostics_text(), lines=14,
+            interactive=False, elem_classes=["mono"],
+        )
+
+        with gr.Tabs():
+            with gr.Tab("Full transcript"):
+                transcript_box = gr.Textbox(
+                    label="Caller and bot turns (chronological, all turns retained)",
+                    lines=16, max_lines=16, interactive=False, autoscroll=True,
+                )
+            with gr.Tab("Live conversation log"):
+                live_box = gr.Textbox(
+                    label="Caller / BOT / SYSTEM / BARGE / ERROR events as they happen",
+                    lines=16, max_lines=16, interactive=False, autoscroll=True,
+                )
+            with gr.Tab("Barge-in diagnostics"):
+                barge_box = gr.Textbox(
+                    label="Noise ignored, speech confirmed, and why playback was interrupted",
+                    lines=12, max_lines=12, interactive=False, autoscroll=True,
+                )
+            with gr.Tab("Error log"):
+                error_box = gr.Textbox(
+                    label="Microphone, transcription, Ollama, Kokoro TTS, and playback errors",
+                    lines=12, max_lines=12, interactive=False, autoscroll=True,
+                )
+
+        with gr.Row():
+            export_button = gr.Button("Export transcript to text file", variant="secondary")
+            clear_logs_button = gr.Button("Clear logs")
+        export_file = gr.File(label="Exported transcript (click to download)", interactive=False)
+
         start_voice_button.click(
             start_voice_mode,
             inputs=[input_device_box, output_device_box, model_box, voice_box, system_prompt_box, barge_threshold_box, confirmation_frames_box],
             outputs=[voice_status],
         )
         stop_voice_button.click(stop_voice_mode, outputs=[voice_status])
+        export_button.click(export_transcript, outputs=[export_file])
+        clear_logs_button.click(clear_logs, outputs=[transcript_box, live_box, barge_box, error_box])
+
+        meter_timer = gr.Timer(0.3)
+        meter_timer.tick(
+            render_level_meter, inputs=[barge_threshold_box], outputs=[level_meter],
+            show_progress="hidden", queue=False,
+        )
+        barge_threshold_box.release(apply_live_settings, inputs=[barge_threshold_box, confirmation_frames_box])
+        confirmation_frames_box.release(apply_live_settings, inputs=[barge_threshold_box, confirmation_frames_box])
+
+        refresh_timer = gr.Timer(1.0)
+        refresh_timer.tick(
+            refresh_views,
+            outputs=[audio_diag_box, transcript_box, live_box, barge_box, error_box, voice_status],
+            show_progress="hidden", queue=False,
+        )
 
     with gr.Tab("Text Chat"):
         chatbot = gr.Chatbot(label="Conversation", type="messages", height=420)
