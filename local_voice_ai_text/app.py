@@ -137,6 +137,7 @@ _cancel_response = threading.Event()
 _pause_playback = threading.Event()
 _response_state_lock = threading.RLock()
 _response_generation = 0
+_context_epoch = 0  # bumped by "Clear context"; stale in-flight work is discarded
 _active_response_cancel = None
 _bot_active = threading.Event()  # set while the bot is generating / synthesizing / speaking
 _audio_queue = queue.Queue(maxsize=120)
@@ -1032,6 +1033,7 @@ def run_response_pipeline(history, transcript, model, voice, prompt, generation,
     """Stream Ollama sentences, synthesize ahead in a bounded queue, and play concurrently."""
     sentence_q, audio_q = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
     sentinel = object()
+    epoch = _context_epoch
     answer_parts, errors = [], []
 
     def llm_producer():
@@ -1111,7 +1113,8 @@ def run_response_pipeline(history, transcript, model, voice, prompt, generation,
         with _state_lock:
             if generation == _response_generation and not cancel_event.is_set():
                 _voice_history.append({"role": "assistant", "content": full_answer})
-        log_event("BOT", full_answer)
+        if epoch == _context_epoch:  # skip if the context was cleared meanwhile
+            log_event("BOT", full_answer)
     return full_answer
 
 
@@ -1126,11 +1129,15 @@ def customer_turn_worker():
         if not _audio_running.is_set():
             break
         try:
+            epoch = _context_epoch
             audio = np.concatenate(utterance)
             set_voice_status("Transcribing complete customer utterance...")
             t0 = time.time()
             transcript = transcribe_audio(audio, _input_sample_rate)
             log_event("SYSTEM", f"Whisper finished in {time.time() - t0:.2f}s.")
+            if epoch != _context_epoch:
+                log_event("SYSTEM", "Utterance discarded: context was cleared during transcription.")
+                continue
             if not transcript:
                 _pause_playback.clear()
                 set_voice_status("Listening for customer...")
@@ -1325,13 +1332,19 @@ def clear_conversation():
 
 
 def clear_context():
-    """Forget model conversation context for text and voice, without erasing diagnostics."""
-    global _response_generation, _active_response_cancel, _voice_history
+    """Reset everything the conversation remembers: text chat, voice history and the voice transcript.
+
+    System / barge-in / error diagnostics are kept; only CALLER and BOT events are removed.
+    Returns values for: message_box, chatbot, audio_output, text_status,
+    transcript_box, live_box, voice_status.
+    """
+    global _response_generation, _active_response_cancel, _voice_history, _context_epoch
 
     # Invalidate/cancel any in-flight voice response so it cannot keep speaking
     # or append an answer based on the context that was just cleared.
     with _response_state_lock:
         _response_generation += 1
+        _context_epoch += 1
         active_cancel = _active_response_cancel
         _active_response_cancel = None
         if active_cancel is not None:
@@ -1340,12 +1353,29 @@ def clear_context():
     _cancel_response.set()
     _interrupt_playback.set()
     _pause_playback.clear()
+    _bot_active.clear()  # the cancelled job can no longer clear this itself (generation changed)
+
+    # Drop caller utterances that were captured but not yet transcribed.
+    while True:
+        try:
+            _turn_queue.get_nowait()
+        except queue.Empty:
+            break
+
     with _state_lock:
         _voice_history = []
 
-    log_event("SYSTEM", "Conversation context cleared; diagnostic transcript retained.")
-    set_voice_status("Context cleared. Ready for a new conversation.")
-    return "", [], None, "Context cleared. Voice and text-chat context reset; diagnostic transcript retained."
+    # Wipe the voice transcript (caller + bot turns) but keep diagnostics.
+    with _events_lock:
+        _events[:] = [e for e in _events if e["kind"] not in ("CALLER", "BOT")]
+
+    log_event("SYSTEM", "Context cleared: text chat, voice history and transcript reset.")
+    set_voice_status("Context cleared. Ready for a new conversation." if _audio_running.is_set()
+                     else "Voice mode stopped.")
+    return (
+        "", [], None, "Context cleared (text chat + voice).",
+        transcript_text(), live_log_text(), get_voice_status(),
+    )
 
 
 def test_fish(voice):
@@ -1500,6 +1530,7 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         with gr.Row():
             export_button = gr.Button("Export transcript to text file", variant="secondary")
             clear_logs_button = gr.Button("Clear logs")
+            clear_context_voice_button = gr.Button("Clear context", variant="stop")
         export_file = gr.File(label="Exported transcript (click to download)", interactive=False)
 
         start_voice_button.click(
@@ -1545,10 +1576,14 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
             clear_context_button = gr.Button("Clear context", variant="stop")
         audio_output = gr.Audio(label="Generated speech", type="filepath", autoplay=False)
         text_status = gr.Textbox(label="Status", value="Ready", interactive=False)
-        send_button.click(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
-        message_box.submit(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
+        send_event = send_button.click(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
+        submit_event = message_box.submit(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
         clear_button.click(clear_conversation, outputs=[message_box, chatbot, audio_output, text_status])
-        clear_context_button.click(clear_context, outputs=[message_box, chatbot, audio_output, text_status])
+        # Both "Clear context" buttons (Text Chat tab and Voice tab) do the same full reset and
+        # also cancel any text reply that is still streaming.
+        _clear_outputs = [message_box, chatbot, audio_output, text_status, transcript_box, live_box, voice_status]
+        for _btn in (clear_context_button, clear_context_voice_button):
+            _btn.click(clear_context, outputs=_clear_outputs, cancels=[send_event, submit_event])
 
     with gr.Accordion("Diagnostics", open=False):
         test_button = gr.Button("Test Ollama connection")
