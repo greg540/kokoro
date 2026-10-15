@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import random
 import tempfile
 import threading
 import time
@@ -14,15 +15,31 @@ import numpy as np
 import requests
 import sounddevice as sd
 import soundfile as sf
+import torch
 from faster_whisper import WhisperModel
-from kokoro import KPipeline
+
+
+def env_bool(name, default=True):
+    """Parse a boolean env var properly ('0', 'false', 'no', 'off', '' are False)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
 
 # ---------------- Configuration ----------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
-DEFAULT_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
-KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
-SAMPLE_RATE = 24000
+
+# Fish Audio TTS (https://docs.fish.audio/features/text-to-speech)
+FISH_API_KEY = os.getenv("FISH_API_KEY", "sk-fish-C26H09jJCvkMEi_zPk0C0Ps_mM1iGTd5LvcGxJNxUfg").strip()
+FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free").strip()
+FISH_TTS_URL = os.getenv("FISH_TTS_URL", "https://api.fish.audio/v1/tts")
+FISH_SAMPLE_RATE = int(os.getenv("FISH_SAMPLE_RATE", "44100"))
+FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "balanced" (fast) or "normal" (most stable)
+FISH_SPEED = float(os.getenv("FISH_SPEED", "1.0"))    # 0.5 - 2.0
+# Optional voice model id (reference_id) from the Fish Audio voice library. Empty = default voice.
+DEFAULT_VOICE = os.getenv("FISH_VOICE_ID", "").strip()
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base.en")
 
 # Tune these if needed. RMS is measured on float audio in the range -1.0 to 1.0.
@@ -30,6 +47,23 @@ VAD_RMS_THRESHOLD = float(os.getenv("VAD_RMS_THRESHOLD", "0.035"))
 VAD_START_FRAMES = int(os.getenv("VAD_START_FRAMES", "6"))
 VAD_END_SILENCE_SECONDS = float(os.getenv("VAD_END_SILENCE_SECONDS", "0.70"))
 VAD_MIN_UTTERANCE_SECONDS = float(os.getenv("VAD_MIN_UTTERANCE_SECONDS", "0.30"))
+
+# Automatic barge-in threshold settings
+AUTO_THRESHOLD_MIN = float(os.getenv("AUTO_THRESHOLD_MIN", "0.020"))
+AUTO_THRESHOLD_MAX = float(os.getenv("AUTO_THRESHOLD_MAX", "0.080"))
+AUTO_THRESHOLD_SMOOTHING = 0.10
+
+# Automatic barge-in threshold is derived from the live noise floor * multiplier.
+THRESHOLD_MULTIPLIER = float(os.getenv("THRESHOLD_MULTIPLIER", "3.0"))
+# Seconds of processing silence before a random "thinking" filler is spoken.
+THINKING_FILLER_DELAY = float(os.getenv("THINKING_FILLER_DELAY", "2.0"))
+
+# Silero VAD (pip install silero-vad): a block counts as speech only when it is loud
+# enough (RMS) AND Silero rates it as human speech, so machinery/clicks/static are rejected.
+USE_SILERO_VAD = env_bool("USE_SILERO_VAD", True)
+VAD_PROB_THRESHOLD = float(os.getenv("VAD_PROB_THRESHOLD", "0.5"))
+SILERO_WINDOW = 512        # Silero requires exactly 512 samples per call at 16 kHz
+SILERO_RATE = 16000
 
 MAX_EVENTS = 5000          # events retained in memory (oldest dropped first)
 LIVE_LOG_LINES = 300       # lines shown in the live log view
@@ -47,8 +81,48 @@ Keep spoken replies concise: usually 1–3 short sentences and under 35 words.
 Ask one clear question at a time when you need information.
 Sound calm, attentive, and professional. Do not claim to be human."""
 
-_kokoro_pipeline = None
+# Short natural phrases spoken to fill the processing gap so there is no dead air.
+THINKING_FILLERS = [
+    "Hmm, let me think about that for a moment.",
+    "Let me consider that for a second.",
+    "Just give me a moment to check that.",
+    "Let me get that straight for you.",
+    "One moment while I look into that.",
+    "Okay, let me think through that.",
+    "Let me pull that together for you.",
+    "Hold on a moment while I check.",
+]
+
+# Canned first-call introduction played once when the caller's first words (e.g. "hello")
+# are detected, before the normal Ollama-generated reply.
+FIRST_INTRODUCTION = os.getenv(
+    "FIRST_INTRODUCTION",
+    "Hi, thanks for calling. I'm the automated assistant here. How can I help you today?",
+)
+PLAY_FIRST_INTRODUCTION = True
+
+# Words/phrases Whisper should favor during recognition. A curated default list of
+# wood-splitter related terms is always used; add your own via WHISPER_HOTWORDS.
+DEFAULT_WHISPER_HOTWORDS = [
+    # machine & parts
+    "splitter", "splitting", "split", "log", "logs", "firewood", "wood",
+    "wedge", "wedges", "ram", "cylinder", "cylinders", "hydraulic", "hydraulics",
+    "pump", "motor", "engine", "deck", "axle", "trailer", "tow", "blade",
+    "concave", "cutting", "gearbox", "chain", "valve", "hose", "frame",
+    # action & feedback
+    "crack", "cracked", "cracking", "crushes", "splits", "jam", "stuck",
+    "grain", "knob", "knot", "ton", "tons", "pressure", "throttle", "choke",
+]
+WHISPER_HOTWORDS = sorted(
+    set(
+        DEFAULT_WHISPER_HOTWORDS
+        + [w.strip() for w in os.getenv("WHISPER_HOTWORDS", "").split(",") if w.strip()]
+    )
+)
+
+_speech_cache = {}  # (text, voice, model, rate) -> wav path, for fixed phrases
 _whisper_model = None
+_silero_model = None
 _model_lock = threading.Lock()
 
 # Audio capture continues independently from transcription, Ollama, and playback.
@@ -73,9 +147,15 @@ _voice_status = "Voice mode stopped."
 _input_device_name = "-"
 _output_device_name = "-"
 
+# Automatic threshold + thinking-filler toggles (live-settable from the UI).
+AUTO_BARGE_THRESHOLD = False
+PLAY_THINKING_FILLERS = True
+_first_intro_played = False  # reset per session in start_voice_mode
+
+
 # ---------------- Event log (transcript + diagnostics) ----------------
 # kinds: CALLER (caller speech), BOT (bot replies), SYSTEM (debug/info),
-#        BARGE (barge-in diagnostics), ERROR (mic / Whisper / Ollama / Kokoro / playback errors)
+#        BARGE (barge-in diagnostics), ERROR (mic / Whisper / Ollama / Fish Audio / playback errors)
 _events = []
 _events_lock = threading.Lock()
 
@@ -85,6 +165,8 @@ _level_history = deque(maxlen=300)
 # Live audio metrics, written by the monitor thread and read by the UI.
 _metrics = {
     "rms_now": 0.0,
+    "vad_now": 0.0,
+    "vad_true_frames": 0,
     "rms_peak_recent": 0.0,
     "rms_peak_session": 0.0,
     "noise_floor": 0.0,
@@ -148,10 +230,16 @@ def audio_diagnostics_text():
         f"Input device:          {_input_device_name}  ({_input_sample_rate} Hz)",
         f"Output device:         {_output_device_name}",
         f"Current level (RMS):   {m['rms_now']:.4f}   {'#' * min(40, int(m['rms_now'] * 400))}",
+        f"Silero VAD (prob):     {m['vad_now']:.3f}   {'#' * min(40, int(m['vad_now'] * 40))}",
         f"Recent peak:           {m['rms_peak_recent']:.4f}",
         f"Session peak:          {m['rms_peak_session']:.4f}",
         f"Noise floor (est.):    {floor:.4f}" + (f"   (suggested threshold ≈ {suggested:.4f})" if suggested else ""),
-        f"Barge-in threshold:    {VAD_RMS_THRESHOLD:.4f}",
+        f"Barge-in threshold:    {VAD_RMS_THRESHOLD:.4f}" + ("   (automatic)" if AUTO_BARGE_THRESHOLD else ""),
+        f"Auto noise multiplier: {THRESHOLD_MULTIPLIER:.1f}x" + ("   ← used" if AUTO_BARGE_THRESHOLD else "   (only when automatic)"),
+        f"Silero VAD:            {'enabled' if USE_SILERO_VAD else 'RMS-only'}" + ("   (prob ≥ {:.2f})".format(VAD_PROB_THRESHOLD) if USE_SILERO_VAD else ""),
+        f"Thinking fillers:      {'on' if PLAY_THINKING_FILLERS else 'off'}   (fills the processing gap)",
+        f"First introduction:    {'on' if PLAY_FIRST_INTRODUCTION else 'off'}" + ("  (played)" if _first_intro_played else "  (pending)"),
+        f"Hotwords:              {len(WHISPER_HOTWORDS)} term(s) favored by Whisper",
         f"Confirmation frames:   {VAD_START_FRAMES}   (currently {m['frames_over']} consecutive above threshold)",
         f"Caller speaking now:   {'yes' if m['speech_active'] else 'no'}",
         f"Bot active:            {'yes' if _bot_active.is_set() else 'no'}",
@@ -167,6 +255,9 @@ def render_level_meter(threshold=None):
     try:
         thr = float(threshold) if threshold is not None else VAD_RMS_THRESHOLD
     except (TypeError, ValueError):
+        thr = VAD_RMS_THRESHOLD
+    # Always show the threshold actually in use (it moves in automatic mode).
+    if AUTO_BARGE_THRESHOLD:
         thr = VAD_RMS_THRESHOLD
     levels = list(_level_history)
     n = _level_history.maxlen
@@ -216,6 +307,60 @@ def apply_live_settings(threshold, frames):
     VAD_RMS_THRESHOLD = float(threshold)
     VAD_START_FRAMES = int(frames)
     log_event("SYSTEM", f"Settings changed live: threshold {VAD_RMS_THRESHOLD:.4f}, confirmation frames {VAD_START_FRAMES}.")
+
+
+def set_auto_threshold(auto):
+    """Toggle automatic barge-in threshold; lock the manual threshold slider when on."""
+    global AUTO_BARGE_THRESHOLD
+    AUTO_BARGE_THRESHOLD = bool(auto)
+    log_event("SYSTEM", f"Automatic barge-in threshold: {'ON' if AUTO_BARGE_THRESHOLD else 'off'}.")
+    # Disable the manual threshold slider while automatic is on, enable the multiplier instead.
+    return gr.update(interactive=not AUTO_BARGE_THRESHOLD), gr.update(interactive=bool(AUTO_BARGE_THRESHOLD))
+
+
+def set_threshold_multiplier(value):
+    """Apply the automatic-threshold noise multiplier live."""
+    global THRESHOLD_MULTIPLIER
+    THRESHOLD_MULTIPLIER = float(value)
+    log_event("SYSTEM", f"Auto threshold multiplier set to {THRESHOLD_MULTIPLIER:.1f}x noise floor.")
+
+
+def set_thinking_fillers(on):
+    global PLAY_THINKING_FILLERS
+    PLAY_THINKING_FILLERS = bool(on)
+    log_event("SYSTEM", f"Thinking fillers: {'ON' if PLAY_THINKING_FILLERS else 'off'}.")
+
+
+def set_first_intro(enabled, text):
+    """Toggle and edit the canned first-call introduction (live-settable)."""
+    global PLAY_FIRST_INTRODUCTION, FIRST_INTRODUCTION
+    PLAY_FIRST_INTRODUCTION = bool(enabled)
+    cleaned = (text or "").strip()
+    if cleaned:
+        FIRST_INTRODUCTION = cleaned
+    log_event(
+        "SYSTEM",
+        f"First-call introduction: {'enabled' if PLAY_FIRST_INTRODUCTION else 'disabled'}.",
+    )
+
+
+def set_silero_vad(on):
+    """Toggle Silero VAD speech detection live (falls back to RMS-only if unavailable)."""
+    global USE_SILERO_VAD
+    USE_SILERO_VAD = bool(on)
+    log_event(
+        "SYSTEM",
+        f"Silero VAD speech detection: {'enabled' if USE_SILERO_VAD else 'disabled (RMS-only)'}.",
+    )
+
+
+def set_fish_settings(api_key, model):
+    """Apply the Fish Audio API key / model live (empty fields keep the current value)."""
+    global FISH_API_KEY, FISH_MODEL
+    if (api_key or "").strip():
+        FISH_API_KEY = api_key.strip()
+    if (model or "").strip():
+        FISH_MODEL = model.strip()
 
 
 def refresh_views():
@@ -331,13 +476,6 @@ def stream_ollama_reply(history, user_text, model, system_prompt, cancel_event=N
                 break
 
 
-def get_kokoro_pipeline():
-    global _kokoro_pipeline
-    if _kokoro_pipeline is None:
-        _kokoro_pipeline = KPipeline(lang_code=KOKORO_LANG)
-    return _kokoro_pipeline
-
-
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
@@ -348,19 +486,178 @@ def get_whisper_model():
     return _whisper_model
 
 
-def make_speech(text, voice):
-    text = ensure_natural_opener(text)
+# ---------------- Silero VAD (silero-vad package) ----------------
+def get_silero_model():
+    """Load Silero VAD from the `silero-vad` pip package. Returns None if unavailable."""
+    global _silero_model
+    if _silero_model is None:
+        with _model_lock:
+            if _silero_model is None:
+                try:
+                    from silero_vad import load_silero_vad
+
+                    torch.set_num_threads(1)
+                    _silero_model = load_silero_vad()
+                    log_event("SYSTEM", "Silero VAD model loaded.")
+                except Exception as exc:
+                    log_event("ERROR", f"Silero VAD unavailable (pip install silero-vad): {exc}")
+                    _silero_model = None
+    return _silero_model
+
+
+class StreamResampler:
+    """Streaming mono resampler to 16 kHz that keeps state between blocks."""
+
+    def __init__(self, src_rate, dst_rate=SILERO_RATE):
+        self.src = int(src_rate)
+        self.dst = int(dst_rate)
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.pos = 0.0  # fractional read position (non-integer-ratio path)
+        self.factor = self.src // self.dst if self.src % self.dst == 0 else None
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if self.src == self.dst:
+            return x
+        self.buf = np.concatenate([self.buf, x])
+        if self.factor:
+            # Integer ratio (e.g. 48000 -> 16000): average groups of samples (cheap low-pass).
+            usable = (len(self.buf) // self.factor) * self.factor
+            if usable == 0:
+                return np.zeros(0, dtype=np.float32)
+            out = self.buf[:usable].reshape(-1, self.factor).mean(axis=1)
+            self.buf = self.buf[usable:]
+            return out.astype(np.float32)
+        # Non-integer ratio (e.g. 44100 -> 16000): linear interpolation with carried position.
+        step = self.src / float(self.dst)
+        n = len(self.buf)
+        if n < 2:
+            return np.zeros(0, dtype=np.float32)
+        count = int(np.floor((n - 1 - self.pos) / step)) + 1
+        if count <= 0:
+            return np.zeros(0, dtype=np.float32)
+        idx = self.pos + step * np.arange(count)
+        out = np.interp(idx, np.arange(n), self.buf)
+        next_pos = self.pos + step * count
+        drop = int(np.floor(next_pos))
+        self.buf = self.buf[drop:]
+        self.pos = next_pos - drop
+        return out.astype(np.float32)
+
+
+class SileroGate:
+    """Feeds exact 512-sample 16 kHz windows to Silero and holds the latest probability."""
+
+    def __init__(self, model, src_rate):
+        self.model = model
+        self.resampler = StreamResampler(src_rate)
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.last_prob = 0.0
+        self.reset()
+
+    def reset(self):
+        try:
+            self.model.reset_states()
+        except Exception:
+            pass
+        self.resampler = StreamResampler(self.resampler.src)
+        self.pending = np.zeros(0, dtype=np.float32)
+        self.last_prob = 0.0
+
+    def process(self, block):
+        """Return the speech probability after consuming this audio block."""
+        self.pending = np.concatenate([self.pending, self.resampler.process(block)])
+        probs = []
+        while len(self.pending) >= SILERO_WINDOW:
+            chunk = self.pending[:SILERO_WINDOW].copy()
+            self.pending = self.pending[SILERO_WINDOW:]
+            with torch.no_grad():
+                probs.append(float(self.model(torch.from_numpy(chunk), SILERO_RATE).item()))
+        if probs:
+            self.last_prob = max(probs)
+        return self.last_prob
+
+
+def make_speech(text, voice, apply_opener=True, cache=False):
+    """Synthesize `text` with the Fish Audio API and return the path of a WAV file.
+
+    `voice` is an optional Fish voice model id (reference_id); empty uses the default voice.
+    `cache=True` reuses audio for fixed phrases (thinking fillers, first introduction) so
+    they play instantly and don't spend API calls.
+    """
+    if apply_opener:
+        text = ensure_natural_opener(text)
     if not text:
         raise ValueError("There is no response text to synthesize.")
-    chunks = []
-    for _, _, audio in get_kokoro_pipeline()(text, voice=voice or DEFAULT_VOICE, speed=1):
-        if audio is not None:
-            chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
-    if not chunks:
-        raise RuntimeError("Kokoro did not return any audio.")
+    if not FISH_API_KEY:
+        raise RuntimeError("Fish Audio API key missing. Set FISH_API_KEY or enter it in the app.")
+
+    voice = (voice or "").strip()
+    cache_key = (text, voice, FISH_MODEL, FISH_SAMPLE_RATE)
+    if cache:
+        cached = _speech_cache.get(cache_key)
+        if cached and Path(cached).exists():
+            return cached
+
+    payload = {
+        "text": text,
+        "format": "wav",
+        "sample_rate": FISH_SAMPLE_RATE,
+        "latency": FISH_LATENCY,
+        "prosody": {"speed": FISH_SPEED, "volume": 0},
+    }
+    if voice:
+        payload["reference_id"] = voice
+    headers = {
+        "Authorization": f"Bearer {FISH_API_KEY}",
+        "Content-Type": "application/json",
+        "model": FISH_MODEL,
+    }
+    try:
+        response = requests.post(FISH_TTS_URL, json=payload, headers=headers, timeout=(10, 60))
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Fish Audio request failed: {exc}") from exc
+    if response.status_code != 200:
+        hints = {
+            401: " (check your API key)",
+            402: " (payment/credit problem)",
+            429: " (rate limit or fair-use limit reached)",
+        }
+        raise RuntimeError(
+            f"Fish Audio HTTP {response.status_code}{hints.get(response.status_code, '')}: {response.text[:300]}"
+        )
+    if not response.content:
+        raise RuntimeError("Fish Audio returned no audio.")
     path = TEMP_DIR / f"speech_{int(time.time() * 1000)}.wav"
-    sf.write(path, np.concatenate(chunks), SAMPLE_RATE)
+    path.write_bytes(response.content)
+    if cache:
+        _speech_cache[cache_key] = str(path)
     return str(path)
+
+
+def play_thinking_filler_if_needed(done_event, running_event, delay=None):
+    """If generation is still running after `delay` seconds, speak a random natural filler.
+
+    Interruptible: caller speech sets _interrupt_playback/_cancel_response and stops it.
+    `done_event` is set by the worker once generation finishes so the filler is not spoken late.
+    """
+    if delay is None:
+        delay = THINKING_FILLER_DELAY
+
+    def _worker():
+        time.sleep(delay)
+        if done_event.is_set() or not running_event.is_set():
+            return
+        try:
+            filler = random.choice(THINKING_FILLERS)
+            path = make_speech(filler, _voice_name, apply_opener=False, cache=True)
+            if done_event.is_set() or not running_event.is_set():
+                return
+            play_audio_interruptibly(path)
+        except Exception as exc:
+            log_event("SYSTEM", f"Thinking filler error: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def device_choices():
@@ -412,9 +709,12 @@ def resample_to_16k(audio, source_rate):
 
 def transcribe_audio(audio, sample_rate):
     audio16 = resample_to_16k(audio, sample_rate)
-    segments, _ = get_whisper_model().transcribe(
-        audio16, language="en", beam_size=1, vad_filter=True, condition_on_previous_text=False
+    transcribe_kwargs = dict(
+        language="en", beam_size=1, vad_filter=True, condition_on_previous_text=False
     )
+    if WHISPER_HOTWORDS:
+        transcribe_kwargs["hotwords"] = " ".join(WHISPER_HOTWORDS)
+    segments, _ = get_whisper_model().transcribe(audio16, **transcribe_kwargs)
     return clean_response_text(" ".join(segment.text.strip() for segment in segments))
 
 
@@ -481,7 +781,7 @@ def audio_input_callback(indata, frames, time_info, status):
 
 def monitor_audio_loop():
     """Only detects speech and queues turns; never waits for Whisper/Ollama/TTS."""
-    global _input_sample_rate
+    global _input_sample_rate, VAD_RMS_THRESHOLD
     speech_chunks = []
     pre_roll = []
     speech_active = False
@@ -494,6 +794,11 @@ def monitor_audio_loop():
     block_seconds = 1024 / float(_input_sample_rate)
     end_silence_frames = max(1, int(VAD_END_SILENCE_SECONDS / block_seconds))
 
+    # Silero is created lazily so it can also be switched on live from the UI.
+    gate = None
+    gate_failed = False
+    gate_was_enabled = False
+
     while _audio_running.is_set():
         try:
             block = _audio_queue.get(timeout=0.15)
@@ -502,11 +807,44 @@ def monitor_audio_loop():
         if not len(block):
             continue
         rms = float(np.sqrt(np.mean(np.square(block, dtype=np.float64)) + 1e-12))
-        voiced = rms >= VAD_RMS_THRESHOLD
+
+        # Automatic thresholding: derive the target from the live noise floor, clamp it to
+        # [MIN, MAX], and move toward it gradually so the threshold doesn't jitter.
+        if AUTO_BARGE_THRESHOLD and _metrics["noise_floor"] > 0:
+            target_threshold = _metrics["noise_floor"] * THRESHOLD_MULTIPLIER
+            target_threshold = max(AUTO_THRESHOLD_MIN, min(AUTO_THRESHOLD_MAX, target_threshold))
+            VAD_RMS_THRESHOLD += AUTO_THRESHOLD_SMOOTHING * (target_threshold - VAD_RMS_THRESHOLD)
+
+        # Silero VAD gate: require human speech, not just loudness.
+        if USE_SILERO_VAD and gate is None and not gate_failed:
+            model = get_silero_model()
+            if model is None:
+                gate_failed = True
+            else:
+                gate = SileroGate(model, _input_sample_rate)
+        silero_on = USE_SILERO_VAD and gate is not None
+        if silero_on and not gate_was_enabled:
+            gate.reset()  # fresh state when (re)enabled
+        gate_was_enabled = silero_on
+
+        if silero_on:
+            try:
+                vad_prob = gate.process(block)
+            except Exception as exc:
+                log_event("ERROR", f"Silero VAD processing failed, falling back to RMS-only: {exc}")
+                gate = None
+                gate_failed = True
+                vad_prob = 1.0
+        else:
+            vad_prob = 1.0
+
+        loud = rms >= VAD_RMS_THRESHOLD
+        voiced = loud and vad_prob >= VAD_PROB_THRESHOLD
         now = time.time()
 
         # ---- live metrics ----
         _metrics["rms_now"] = rms
+        _metrics["vad_now"] = vad_prob
         _level_history.append(rms)
         _metrics["rms_peak_session"] = max(_metrics["rms_peak_session"], rms)
         if now - last_peak_decay > 2.0:
@@ -552,14 +890,14 @@ def monitor_audio_loop():
                     log_event(
                         "BARGE",
                         f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
-                        f"(peak RMS {burst_peak:.4f}). Bot was active -> playback interrupted and "
-                        "in-flight reply cancelled.",
+                        f"(peak RMS {burst_peak:.4f}, Silero {vad_prob:.2f}). Bot was active -> playback "
+                        "interrupted and in-flight reply cancelled.",
                     )
                 else:
                     log_event(
                         "BARGE",
                         f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
-                        f"(peak RMS {burst_peak:.4f}). Bot idle -> nothing to interrupt.",
+                        f"(peak RMS {burst_peak:.4f}, Silero {vad_prob:.2f}). Bot idle -> nothing to interrupt.",
                     )
                 stop_playback()  # Barge-in: stop speech and cancel any in-flight reply.
                 set_voice_status("Customer speaking — AI audio interrupted.")
@@ -576,6 +914,8 @@ def monitor_audio_loop():
             consecutive_voice = 0
             silence_frames = 0
             pre_roll = []
+            if silero_on:
+                gate.reset()  # reset Silero's recurrent state between utterances
             duration = sum(len(part) for part in utterance) / float(_input_sample_rate)
             if duration >= VAD_MIN_UTTERANCE_SECONDS:
                 _metrics["utterances"] += 1
@@ -599,7 +939,7 @@ def monitor_audio_loop():
 
 def customer_turn_worker():
     """Processes complete utterances while the independent monitor keeps listening."""
-    global _voice_history
+    global _voice_history, _first_intro_played
     while _audio_running.is_set():
         try:
             utterance = _turn_queue.get(timeout=0.2)
@@ -626,6 +966,19 @@ def customer_turn_worker():
                 continue
 
             log_event("CALLER", transcript)
+
+            # Play the canned first-call introduction once per session, before the normal reply.
+            if PLAY_FIRST_INTRODUCTION and not _first_intro_played:
+                _first_intro_played = True
+                set_voice_status("Greeting caller...")
+                try:
+                    intro_path = make_speech(FIRST_INTRODUCTION, _voice_name, apply_opener=False, cache=True)
+                    if not _interrupt_playback.is_set() and _audio_running.is_set():
+                        play_audio_interruptibly(intro_path)
+                        log_event("BOT", FIRST_INTRODUCTION)
+                except Exception as exc:
+                    log_event("ERROR", f"First introduction error: {exc}")
+
             with _state_lock:
                 # The latest transcript becomes the new user turn.
                 _voice_history.append({"role": "user", "content": transcript})
@@ -636,15 +989,16 @@ def customer_turn_worker():
             stage = "Ollama"
             answer = ""
             t0 = time.time()
-            for partial in stream_ollama_reply(history, transcript, model, prompt, _cancel_response):
-                if _cancel_response.is_set() or not _audio_running.is_set():
-                    break
-                answer = partial
-            if _cancel_response.is_set() or not _audio_running.is_set():
-                log_event("SYSTEM", "Reply generation cancelled because the caller spoke.")
-                set_voice_status("Customer interrupted; listening for the next utterance.")
-                _bot_active.clear()
-                continue
+            _generation_done = threading.Event()
+            if PLAY_THINKING_FILLERS:
+                play_thinking_filler_if_needed(_generation_done, _audio_running, delay=THINKING_FILLER_DELAY)
+            try:
+                for partial in stream_ollama_reply(history, transcript, model, prompt, _cancel_response):
+                    if _cancel_response.is_set() or not _audio_running.is_set():
+                        break
+                    answer = partial
+            finally:
+                _generation_done.set()
             log_event("SYSTEM", f"Ollama finished in {time.time() - t0:.2f}s (model {model}).")
 
             answer = ensure_natural_opener(answer)
@@ -658,10 +1012,10 @@ def customer_turn_worker():
             log_event("BOT", answer)
             set_voice_status(f"Speaking: {answer}")
 
-            stage = "text-to-speech (Kokoro)"
+            stage = "text-to-speech (Fish Audio)"
             t0 = time.time()
             speech_path = make_speech(answer, voice)
-            log_event("SYSTEM", f"Kokoro synthesized audio in {time.time() - t0:.2f}s.")
+            log_event("SYSTEM", f"Fish Audio synthesized audio in {time.time() - t0:.2f}s.")
             # Do not clear an interrupt that arrived during synthesis.
             if not _interrupt_playback.is_set() and _audio_running.is_set():
                 stage = "playback"
@@ -683,6 +1037,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
     global _audio_stream, _monitor_thread, _turn_thread, _input_device_index, _output_device_index
     global _input_sample_rate, _voice_model, _voice_name, _voice_system_prompt, _voice_history
     global VAD_RMS_THRESHOLD, VAD_START_FRAMES, _input_device_name, _output_device_name
+    global _first_intro_played
     if _audio_running.is_set():
         return "Voice mode is already running."
     input_index, output_index = parse_device_index(input_label), parse_device_index(output_label)
@@ -704,6 +1059,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
         _voice_name = voice or DEFAULT_VOICE
         _voice_system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         _voice_history = []
+        _first_intro_played = False
         while not _audio_queue.empty():
             try:
                 _audio_queue.get_nowait()
@@ -718,8 +1074,8 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
         _cancel_response.clear()
         _bot_active.clear()
         _metrics.update(
-            rms_now=0.0, rms_peak_recent=0.0, rms_peak_session=0.0, noise_floor=0.0,
-            speech_active=False, frames_over=0, mic_status="",
+            rms_now=0.0, vad_now=0.0, vad_true_frames=0, rms_peak_recent=0.0, rms_peak_session=0.0,
+            noise_floor=0.0, speech_active=False, frames_over=0, mic_status="",
         )
         log_event("SYSTEM", "=== Voice session started ===")
         log_event(
@@ -794,7 +1150,7 @@ def send_message(message, history, model, voice, system_prompt):
         answer = ensure_natural_opener(answer)
         history[-1]["content"] = answer
         log_event("BOT", answer, source="text")
-        stage = "text-to-speech (Kokoro)"
+        stage = "text-to-speech (Fish Audio)"
         speech_path = make_speech(answer, voice)
         yield "", history, speech_path, "Response ready."
     except Exception as exc:
@@ -805,6 +1161,17 @@ def send_message(message, history, model, voice, system_prompt):
 
 def clear_conversation():
     return "", [], None, "Conversation cleared."
+
+
+def test_fish(voice):
+    """Synthesize a short phrase to verify the API key, model, and voice."""
+    try:
+        t0 = time.time()
+        path = make_speech("Testing Fish Audio.", voice, apply_opener=False)
+        return f"Fish Audio OK: model {FISH_MODEL}, {os.path.getsize(path)} bytes in {time.time() - t0:.2f}s."
+    except Exception as exc:
+        log_event("ERROR", f"Fish Audio test failed: {exc}")
+        return f"Fish Audio test failed: {exc}"
 
 
 def test_ollama():
@@ -838,22 +1205,30 @@ NO_FLASH_CSS = """
 with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=NO_FLASH_CSS) as demo:
     gr.Markdown("# Local Text + Voice AI")
     gr.Markdown(
-        "Local Ollama + Kokoro with a continuous VoiceMeeter audio path. For Vonage, the input should "
+        "Local Ollama + Fish Audio with a continuous VoiceMeeter audio path. For Vonage, the input should "
         "contain caller audio only; do not route the AI's own voice back into the customer-audio input."
     )
     with gr.Row():
         model_box = gr.Textbox(label="Ollama model", value=DEFAULT_MODEL)
-        voice_box = gr.Dropdown(
-            label="Kokoro voice",
-            choices=["af_heart", "af_bella", "af_nicole", "af_sarah", "am_adam", "am_michael", "am_echo"],
-            value=DEFAULT_VOICE, allow_custom_value=True,
+        voice_box = gr.Textbox(
+            label="Fish voice ID (reference_id, optional)", value=DEFAULT_VOICE,
+            info="Leave empty for Fish's default voice. Copy an ID from the Fish Audio voice library.",
         )
+    with gr.Row():
+        fish_model_box = gr.Textbox(label="Fish Audio model", value=FISH_MODEL, info="s2.1-pro-free, s2.1-pro, s2-pro")
+        fish_key_box = gr.Textbox(
+            label="Fish Audio API key", type="password", value="",
+            placeholder="Using FISH_API_KEY from environment" if FISH_API_KEY else "Paste your Fish Audio API key",
+        )
+    fish_model_box.change(set_fish_settings, inputs=[fish_key_box, fish_model_box])
+    fish_key_box.change(set_fish_settings, inputs=[fish_key_box, fish_model_box])
     system_prompt_box = gr.Textbox(label="System prompt", value=DEFAULT_SYSTEM_PROMPT, lines=5)
 
     with gr.Tab("Voice / Vonage"):
         gr.Markdown(
             "**Barge-in enabled:** raise the RMS threshold and/or require more consecutive audio frames "
-            "to prevent background noise from interrupting the AI. The sliders apply live (when you release them); the graph below shows your input volume with the threshold line, so you can tune it while watching."
+            "to prevent background noise from interrupting the AI. The sliders apply live (when you release them); the graph below shows your input volume with the threshold line, so you can tune it while watching. "
+            "Turn on **Automatic barge-in threshold** to derive it from the live noise floor instead of a fixed value, enable **Silero VAD** to require human speech (not just loudness) before interrupting, and turn on **thinking fillers** to speak a short natural phrase during processing so there is no dead air. A **first-call introduction** plays when the caller's first words (e.g. 'hello') are detected."
         )
         with gr.Row():
             input_device_box = gr.Dropdown(label="Customer audio input", choices=INPUT_CHOICES, value=DEFAULT_INPUT_DEVICE, allow_custom_value=True)
@@ -868,6 +1243,42 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
                 label="Speech confirmation frames", info="Higher = sound must stay above threshold longer before interrupting."
             )
         with gr.Row():
+            auto_threshold_box = gr.Checkbox(
+                value=False,
+                label="Automatic barge-in threshold",
+                info="Derive the threshold from the live noise floor (× multiplier) instead of a fixed value.",
+            )
+            threshold_multiplier_box = gr.Slider(
+                minimum=1.5, maximum=6.0, value=THRESHOLD_MULTIPLIER, step=0.5,
+                label="Auto threshold multiplier (× noise floor)",
+                info="Higher = needs louder speech to interrupt. Only used when automatic threshold is on.",
+                interactive=False,
+            )
+        with gr.Row():
+            silero_vad_box = gr.Checkbox(
+                value=USE_SILERO_VAD,
+                label="Silero VAD speech detection",
+                info="Require human speech, not just loudness, before interrupting — rejects machinery, clicks, static.",
+            )
+        with gr.Row():
+            fillers_box = gr.Checkbox(
+                value=True,
+                label="Play natural 'thinking' fillers while the AI responds",
+                info="Speaks a short filler (e.g. 'Hmm, let me think') during processing so there is no dead air.",
+            )
+        with gr.Row():
+            first_intro_enable = gr.Checkbox(
+                value=True,
+                label="Play first-call introduction",
+                info="Canned greeting played once per session when the caller's first words (e.g. 'hello') are detected.",
+            )
+        first_intro_box = gr.Textbox(
+            label="First-call introduction text",
+            value=FIRST_INTRODUCTION,
+            lines=2,
+            info="Spoken once at the start of the call. Only used when the toggle above is on.",
+        )
+        with gr.Row():
             start_voice_button = gr.Button("Start Voice Mode", variant="primary")
             stop_voice_button = gr.Button("Stop Voice Mode")
         voice_status = gr.Textbox(label="Voice status", value="Voice mode stopped.", interactive=False)
@@ -875,7 +1286,7 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         level_meter = gr.HTML(value=render_level_meter(), label="Input volume vs. barge-in threshold")
 
         audio_diag_box = gr.Textbox(
-            label="Audio troubleshooting (live)", value=audio_diagnostics_text(), lines=14,
+            label="Audio troubleshooting (live)", value=audio_diagnostics_text(), lines=16,
             interactive=False, elem_classes=["mono"],
         )
 
@@ -897,7 +1308,7 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
                 )
             with gr.Tab("Error log"):
                 error_box = gr.Textbox(
-                    label="Microphone, transcription, Ollama, Kokoro TTS, and playback errors",
+                    label="Microphone, transcription, Ollama, Fish Audio TTS, and playback errors",
                     lines=12, max_lines=12, interactive=False, autoscroll=True,
                 )
 
@@ -922,6 +1333,16 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         )
         barge_threshold_box.release(apply_live_settings, inputs=[barge_threshold_box, confirmation_frames_box])
         confirmation_frames_box.release(apply_live_settings, inputs=[barge_threshold_box, confirmation_frames_box])
+        auto_threshold_box.change(
+            set_auto_threshold,
+            inputs=[auto_threshold_box],
+            outputs=[barge_threshold_box, threshold_multiplier_box],
+        )
+        threshold_multiplier_box.release(set_threshold_multiplier, inputs=[threshold_multiplier_box])
+        silero_vad_box.change(set_silero_vad, inputs=[silero_vad_box])
+        fillers_box.change(set_thinking_fillers, inputs=[fillers_box])
+        first_intro_enable.change(set_first_intro, inputs=[first_intro_enable, first_intro_box])
+        first_intro_box.change(set_first_intro, inputs=[first_intro_enable, first_intro_box])
 
         refresh_timer = gr.Timer(1.0)
         refresh_timer.tick(
@@ -931,7 +1352,7 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         )
 
     with gr.Tab("Text Chat"):
-        chatbot = gr.Chatbot(label="Conversation", type="messages", height=420)
+        chatbot = gr.Chatbot(label="Conversation", type="messages", height=420, allow_tags=False)
         message_box = gr.Textbox(label="Message", placeholder="Type a message and press Enter", lines=2)
         with gr.Row():
             send_button = gr.Button("Send", variant="primary")
@@ -946,11 +1367,25 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         test_button = gr.Button("Test Ollama connection")
         test_status = gr.Textbox(label="Ollama status", interactive=False)
         test_button.click(test_ollama, outputs=[test_status])
+        fish_test_button = gr.Button("Test Fish Audio")
+        fish_test_status = gr.Textbox(label="Fish Audio status", interactive=False)
+        fish_test_button.click(test_fish, inputs=[voice_box], outputs=[fish_test_status])
         gr.Markdown(
             "If VoiceMeeter devices are missing, restart this app after VoiceMeeter is running. "
-            "faster-whisper downloads its model on first use unless it is already cached. Install required "
-            "packages with: `pip install faster-whisper sounddevice`."
+            "Silero VAD requires `pip install silero-vad`; if it cannot load, detection falls back "
+            "to RMS-only. faster-whisper downloads its model on first use unless it is already "
+            "cached. Install required packages with: `pip install faster-whisper sounddevice silero-vad`."
         )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, share=False)
+    import warnings
+
+    # Silence Gradio 6.0 deprecation warnings (theme/css moved to launch(); chatbot allow_tags).
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        inbrowser=True,
+        share=False,
+    )
