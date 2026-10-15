@@ -32,7 +32,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstr
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 
 # Fish Audio TTS (https://docs.fish.audio/features/text-to-speech)
-FISH_API_KEY = os.getenv("FISH_API_KEY", "sk-fish-C26H09jJCvkMEi_zPk0C0Ps_mM1iGTd5LvcGxJNxUfg").strip()
+FISH_API_KEY = os.getenv("FISH_API_KEY", "").strip()
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free").strip()
 FISH_TTS_URL = os.getenv("FISH_TTS_URL", "https://api.fish.audio/v1/tts")
 FISH_SAMPLE_RATE = int(os.getenv("FISH_SAMPLE_RATE", "44100"))
@@ -41,11 +41,14 @@ FISH_SPEED = float(os.getenv("FISH_SPEED", "1.0"))    # 0.5 - 2.0
 # Optional voice model id (reference_id) from the Fish Audio voice library. Empty = default voice.
 DEFAULT_VOICE = os.getenv("FISH_VOICE_ID", "").strip()
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base.en")
+# Whisper compute device: "auto" (use CUDA if an NVIDIA GPU with a CUDA-enabled torch is
+# present, else CPU), "cuda", or "cpu". GPU transcription is typically 2-4x faster than CPU.
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto").strip().lower()
 
 # Tune these if needed. RMS is measured on float audio in the range -1.0 to 1.0.
 VAD_RMS_THRESHOLD = float(os.getenv("VAD_RMS_THRESHOLD", "0.035"))
 VAD_START_FRAMES = int(os.getenv("VAD_START_FRAMES", "6"))
-VAD_END_SILENCE_SECONDS = float(os.getenv("VAD_END_SILENCE_SECONDS", "0.70"))
+VAD_END_SILENCE_SECONDS = float(os.getenv("VAD_END_SILENCE_SECONDS", "0.55"))
 VAD_MIN_UTTERANCE_SECONDS = float(os.getenv("VAD_MIN_UTTERANCE_SECONDS", "0.30"))
 
 # Automatic barge-in threshold settings
@@ -56,7 +59,9 @@ AUTO_THRESHOLD_SMOOTHING = 0.10
 # Automatic barge-in threshold is derived from the live noise floor * multiplier.
 THRESHOLD_MULTIPLIER = float(os.getenv("THRESHOLD_MULTIPLIER", "3.0"))
 # Seconds of processing silence before a random "thinking" filler is spoken.
-THINKING_FILLER_DELAY = float(os.getenv("THINKING_FILLER_DELAY", "2.0"))
+# Kept short so the filler kicks in before you notice dead air, but long enough
+# that fast replies (the common case) never trigger it.
+THINKING_FILLER_DELAY = float(os.getenv("THINKING_FILLER_DELAY", "1.3"))
 
 # Silero VAD (pip install silero-vad): a block counts as speech only when it is loud
 # enough (RMS) AND Silero rates it as human speech, so machinery/clicks/static are rejected.
@@ -82,15 +87,15 @@ Ask one clear question at a time when you need information.
 Sound calm, attentive, and professional. Do not claim to be human."""
 
 # Short natural phrases spoken to fill the processing gap so there is no dead air.
+# Kept short (~1.5–2.5 s each) so a filler never outlasts a fast reply and so it can be
+# cut cleanly the moment the real answer is ready.
 THINKING_FILLERS = [
-    "Hmm, let me think about that for a moment.",
-    "Let me consider that for a second.",
-    "Just give me a moment to check that.",
-    "Let me get that straight for you.",
-    "One moment while I look into that.",
-    "Okay, let me think through that.",
-    "Let me pull that together for you.",
-    "Hold on a moment while I check.",
+    "Hold on a moment.",
+    "Let me check that for you.",
+    "Give me a second.",
+    "Let me think about that.",
+    "One moment, please.",
+    "Let me get that straight.",
 ]
 
 # Canned first-call introduction played once when the caller's first words (e.g. "hello")
@@ -129,6 +134,10 @@ _model_lock = threading.Lock()
 _audio_running = threading.Event()
 _interrupt_playback = threading.Event()
 _cancel_response = threading.Event()
+_pause_playback = threading.Event()
+_response_state_lock = threading.RLock()
+_response_generation = 0
+_active_response_cancel = None
 _bot_active = threading.Event()  # set while the bot is generating / synthesizing / speaking
 _audio_queue = queue.Queue(maxsize=120)
 _turn_queue = queue.Queue(maxsize=8)
@@ -411,7 +420,7 @@ def clean_response_text(text):
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", str(text))
-    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"< think>.*?< /think>", " ", text, flags=re.I | re.S)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
     text = re.sub(r"(?m)^\s*[-*•]\s+", "", text)
@@ -446,34 +455,89 @@ def build_messages(history, user_text, system_prompt):
     return messages
 
 
-def stream_ollama_reply(history, user_text, model, system_prompt, cancel_event=None):
+def stream_ollama_tokens(history, user_text, model, system_prompt, cancel_event=None):
+    """Yield incremental Ollama content tokens."""
     url = f"{ollama_native_base_url()}/api/chat"
     payload = {
         "model": (model or DEFAULT_MODEL).strip(),
         "messages": build_messages(history, user_text, system_prompt),
-        "stream": True,
-        "think": False,
-        "keep_alive": "30m",
+        "stream": True, "think": False, "keep_alive": "30m",
         "options": {"temperature": 0.5, "num_predict": 100, "num_ctx": 2048},
     }
-    with requests.post(url, json=payload, stream=True, timeout=(10, 180)) as response:
-        response.raise_for_status()
-        accumulated = ""
-        for line in response.iter_lines(decode_unicode=True):
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            if not line:
-                continue
-            try:
-                packet = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            message = packet.get("message", {})
-            accumulated += message.get("content", "") or ""
-            if accumulated:
-                yield ensure_natural_opener(accumulated)
-            if packet.get("done"):
-                break
+    request_started = time.perf_counter()
+    first_token_at = None
+    log_event("OLLAMA", f"Request started: model={payload['model']}.")
+    try:
+        with requests.post(url, json=payload, stream=True, timeout=(10, 180)) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if cancel_event is not None and cancel_event.is_set():
+                    log_event("OLLAMA", f"Request cancelled after {time.perf_counter() - request_started:.2f}s.")
+                    return
+                if not line:
+                    continue
+                try:
+                    packet = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                token = (packet.get("message") or {}).get("content", "") or ""
+                if token:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        log_event("OLLAMA", f"First token in {first_token_at - request_started:.2f}s.")
+                    yield token
+                if packet.get("done"):
+                    total = time.perf_counter() - request_started
+                    eval_count = packet.get("eval_count")
+                    eval_duration = packet.get("eval_duration")
+                    details = []
+                    if eval_count is not None:
+                        details.append(f"{eval_count} generated tokens")
+                    if eval_duration:
+                        details.append(f"generation rate {eval_count / (eval_duration / 1e9):.1f} tok/s" if eval_count else f"eval duration {eval_duration / 1e9:.2f}s")
+                    suffix = f" ({', '.join(details)})" if details else ""
+                    log_event("OLLAMA", f"Request completed in {total:.2f}s{suffix}.")
+                    break
+    except Exception as exc:
+        log_event("ERROR", f"Ollama request failed after {time.perf_counter() - request_started:.2f}s: {exc}")
+        raise
+
+
+def stream_ollama_reply(history, user_text, model, system_prompt, cancel_event=None):
+    """Compatibility wrapper for the text-chat UI; yields cumulative cleaned text."""
+    accumulated = ""
+    for token in stream_ollama_tokens(history, user_text, model, system_prompt, cancel_event):
+        accumulated += token
+        cleaned = ensure_natural_opener(accumulated)
+        if cleaned:
+            yield cleaned
+
+
+def split_complete_sentences(buffer):
+    parts = re.split(r'(?<=[.!?])\s+', buffer)
+    if len(parts) == 1:
+        return [], buffer
+    return [p.strip() for p in parts[:-1] if p.strip()], parts[-1]
+
+
+def resolve_whisper_device():
+    """Pick the Whisper compute device. Falls back to CPU if CUDA was requested but is absent."""
+    if WHISPER_DEVICE == "cpu":
+        return "cpu"
+    if WHISPER_DEVICE == "cuda":
+        if not torch.cuda.is_available():
+            log_event("ERROR", "WHISPER_DEVICE=cuda set but CUDA is unavailable; falling back to CPU.")
+            return "cpu"
+        return "cuda"
+    # "auto" (default): use a GPU whenever one is available.
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_whisper_compute_type(device):
+    """int8 for CPU; int8_float16 for most CUDA cards, int8 only for old Pascal cards."""
+    if device == "cuda":
+        return "int8_float16"
+    return "int8"
 
 
 def get_whisper_model():
@@ -481,8 +545,14 @@ def get_whisper_model():
     if _whisper_model is None:
         with _model_lock:
             if _whisper_model is None:
-                # CPU int8 is a reliable Windows default. Whisper downloads its model on first use.
-                _whisper_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+                # Whisper downloads its model on first use. "auto" picks CUDA when an NVIDIA
+                # GPU with a CUDA-enabled torch is present, otherwise CPU int8.
+                device = resolve_whisper_device()
+                compute_type = resolve_whisper_compute_type(device)
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL_NAME, device=device, compute_type=compute_type
+                )
+                log_event("SYSTEM", f"Whisper loaded on {device} ({compute_type}).")
     return _whisper_model
 
 
@@ -735,26 +805,34 @@ def stop_playback():
     _cancel_response.set()
 
 
-def play_audio_interruptibly(path):
-    """Play small blocks so a confirmed customer interruption can stop output quickly."""
+def play_audio_interruptibly(path, generation=None, cancel_event=None):
+    """Play in short blocks; pause preserves the sample cursor, cancellation discards it."""
     if _output_device_index is None or not _audio_running.is_set():
         return
     try:
         audio, rate = sf.read(path, dtype="float32", always_2d=False)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        block = max(1, int(rate * 0.025))  # about 25 ms per block
-        _interrupt_playback.clear()
-        total = len(audio)
-        with sd.OutputStream(
-            device=_output_device_index, samplerate=rate, channels=1, dtype="float32", latency="low"
-        ) as stream:
-            for start in range(0, total, block):
-                if not _audio_running.is_set() or _interrupt_playback.is_set():
-                    pct = int(100 * start / max(1, total))
-                    log_event("SYSTEM", f"Playback stopped early at {pct}% of the bot's audio.")
+        block = max(1, int(rate * 0.020))
+        cursor = 0
+        with sd.OutputStream(device=_output_device_index, samplerate=rate, channels=1,
+                             dtype="float32", latency="low") as stream:
+            while cursor < len(audio):
+                if not _audio_running.is_set():
                     return
-                stream.write(audio[start:start + block])
+                if cancel_event is not None and cancel_event.is_set():
+                    log_event("BARGE", "Obsolete response audio discarded after a new customer turn.")
+                    return
+                if generation is not None:
+                    with _response_state_lock:
+                        if generation != _response_generation:
+                            return
+                if _pause_playback.is_set():
+                    time.sleep(0.02)
+                    continue
+                end = min(cursor + block, len(audio))
+                stream.write(audio[cursor:end])
+                cursor = end
         log_event("SYSTEM", "Playback finished normally.")
     except Exception as exc:
         set_voice_status(f"Audio playback error: {exc}")
@@ -891,7 +969,7 @@ def monitor_audio_loop():
                         "BARGE",
                         f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
                         f"(peak RMS {burst_peak:.4f}, Silero {vad_prob:.2f}). Bot was active -> playback "
-                        "interrupted and in-flight reply cancelled.",
+                        "AI playback paused; caller utterance will be transcribed before deciding whether to resume or replace the reply.",
                     )
                 else:
                     log_event(
@@ -899,8 +977,8 @@ def monitor_audio_loop():
                         f"Speech confirmed: {consecutive_voice} frames ≥ {VAD_RMS_THRESHOLD:.4f} "
                         f"(peak RMS {burst_peak:.4f}, Silero {vad_prob:.2f}). Bot idle -> nothing to interrupt.",
                     )
-                stop_playback()  # Barge-in: stop speech and cancel any in-flight reply.
-                set_voice_status("Customer speaking — AI audio interrupted.")
+                _pause_playback.set()  # Preserve the current sample cursor while the caller speaks.
+                set_voice_status("Customer speaking — AI audio paused; listening to interruption.")
                 burst_peak = 0.0
             continue
 
@@ -937,9 +1015,109 @@ def monitor_audio_loop():
                 )
 
 
+def is_brief_acknowledgment(text):
+    raw = (text or "").strip()
+    t = re.sub(r"[^a-z0-9' ]", "", raw.lower()).strip()
+    if not t or "?" in raw:
+        return False
+    acknowledgments = {
+        "yes", "yeah", "yep", "yup", "okay", "ok", "right", "correct",
+        "got it", "i see", "sure", "uh huh", "mm hmm", "mhm", "thanks",
+        "thank you", "alright", "all right", "exactly"
+    }
+    return len(t.split()) <= 4 and t in acknowledgments
+
+
+def run_response_pipeline(history, transcript, model, voice, prompt, generation, cancel_event):
+    """Stream Ollama sentences, synthesize ahead in a bounded queue, and play concurrently."""
+    sentence_q, audio_q = queue.Queue(maxsize=8), queue.Queue(maxsize=4)
+    sentinel = object()
+    answer_parts, errors = [], []
+
+    def llm_producer():
+        buffer, first = "", True
+        try:
+            for token in stream_ollama_tokens(history, transcript, model, prompt, cancel_event):
+                if cancel_event.is_set() or not _audio_running.is_set():
+                    break
+                buffer += token
+                complete, buffer = split_complete_sentences(buffer)
+                for sentence in complete:
+                    sentence = clean_response_text(sentence)
+                    if first and sentence:
+                        sentence = ensure_natural_opener(sentence)
+                        first = False
+                    if sentence:
+                        answer_parts.append(sentence)
+                        sentence_q.put(sentence)
+            tail = clean_response_text(buffer)
+            if tail and not cancel_event.is_set():
+                if first:
+                    tail = ensure_natural_opener(tail)
+                answer_parts.append(tail)
+                sentence_q.put(tail)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            sentence_q.put(sentinel)
+
+    def tts_producer():
+        try:
+            while not cancel_event.is_set() and _audio_running.is_set():
+                item = sentence_q.get()
+                if item is sentinel:
+                    break
+                fish_started = time.perf_counter()
+                log_event("FISH", f"TTS started ({len(item)} chars): {item[:100]}")
+                path = make_speech(item, voice, apply_opener=False)
+                fish_elapsed = time.perf_counter() - fish_started
+                log_event("FISH", f"TTS completed in {fish_elapsed:.2f}s; audio={os.path.getsize(path)} bytes.")
+                if cancel_event.is_set():
+                    break
+                audio_q.put((item, path))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            audio_q.put(sentinel)
+
+    llm_thread = threading.Thread(target=llm_producer, daemon=True)
+    tts_thread = threading.Thread(target=tts_producer, daemon=True)
+    llm_thread.start()
+    tts_thread.start()
+    try:
+        while _audio_running.is_set() and not cancel_event.is_set():
+            with _response_state_lock:
+                if generation != _response_generation:
+                    break
+            try:
+                item = audio_q.get(timeout=0.1)
+            except queue.Empty:
+                if not llm_thread.is_alive() and not tts_thread.is_alive():
+                    break
+                continue
+            if item is sentinel:
+                break
+            sentence, path = item
+            play_audio_interruptibly(path, generation=generation, cancel_event=cancel_event)
+        llm_thread.join(timeout=1)
+        tts_thread.join(timeout=1)
+    finally:
+        if not _audio_running.is_set():
+            cancel_event.set()
+    full_answer = clean_response_text(" ".join(answer_parts))
+    if errors and not cancel_event.is_set():
+        raise errors[0]
+    if full_answer:
+        with _state_lock:
+            if generation == _response_generation and not cancel_event.is_set():
+                _voice_history.append({"role": "assistant", "content": full_answer})
+        log_event("BOT", full_answer)
+    return full_answer
+
+
 def customer_turn_worker():
-    """Processes complete utterances while the independent monitor keeps listening."""
-    global _voice_history, _first_intro_played
+    """Transcribe caller speech while playback is paused; resume acknowledgments or replace response."""
+    global _voice_history, _first_intro_played, _response_generation, _active_response_cancel
     while _audio_running.is_set():
         try:
             utterance = _turn_queue.get(timeout=0.2)
@@ -947,90 +1125,67 @@ def customer_turn_worker():
             continue
         if not _audio_running.is_set():
             break
-        # Clear the previous turn's interruption flags before processing this utterance.
-        # Any new speech detected during transcription/generation will set them again.
-        _interrupt_playback.clear()
-        _cancel_response.clear()
-        audio = np.concatenate(utterance)
-        stage = "transcription (Whisper)"
-        _bot_active.set()
         try:
-            set_voice_status("Transcribing customer...")
+            audio = np.concatenate(utterance)
+            set_voice_status("Transcribing complete customer utterance...")
             t0 = time.time()
             transcript = transcribe_audio(audio, _input_sample_rate)
             log_event("SYSTEM", f"Whisper finished in {time.time() - t0:.2f}s.")
             if not transcript:
-                log_event("SYSTEM", "Whisper returned no text (silence or noise); no reply generated.")
+                _pause_playback.clear()
                 set_voice_status("Listening for customer...")
-                _bot_active.clear()
+                continue
+            log_event("CALLER", transcript)
+            if _pause_playback.is_set() and is_brief_acknowledgment(transcript):
+                log_event("BARGE", f"Brief acknowledgment ({transcript!r}); resuming at saved audio position.")
+                _pause_playback.clear()
+                set_voice_status("Resuming previous response...")
                 continue
 
-            log_event("CALLER", transcript)
-
-            # Play the canned first-call introduction once per session, before the normal reply.
-            if PLAY_FIRST_INTRODUCTION and not _first_intro_played:
-                _first_intro_played = True
-                set_voice_status("Greeting caller...")
-                try:
-                    intro_path = make_speech(FIRST_INTRODUCTION, _voice_name, apply_opener=False, cache=True)
-                    if not _interrupt_playback.is_set() and _audio_running.is_set():
-                        play_audio_interruptibly(intro_path)
-                        log_event("BOT", FIRST_INTRODUCTION)
-                except Exception as exc:
-                    log_event("ERROR", f"First introduction error: {exc}")
-
+            with _response_state_lock:
+                old_cancel = _active_response_cancel
+                _response_generation += 1
+                generation = _response_generation
+                cancel_event = threading.Event()
+                _active_response_cancel = cancel_event
+            if old_cancel is not None:
+                old_cancel.set()
+            _pause_playback.clear()
             with _state_lock:
-                # The latest transcript becomes the new user turn.
                 _voice_history.append({"role": "user", "content": transcript})
                 history = list(_voice_history[:-1])
                 model, voice, prompt = _voice_model, _voice_name, _voice_system_prompt
             set_voice_status(f"Customer: {transcript}")
+            _bot_active.set()
 
-            stage = "Ollama"
-            answer = ""
-            t0 = time.time()
-            _generation_done = threading.Event()
-            if PLAY_THINKING_FILLERS:
-                play_thinking_filler_if_needed(_generation_done, _audio_running, delay=THINKING_FILLER_DELAY)
-            try:
-                for partial in stream_ollama_reply(history, transcript, model, prompt, _cancel_response):
-                    if _cancel_response.is_set() or not _audio_running.is_set():
-                        break
-                    answer = partial
-            finally:
-                _generation_done.set()
-            log_event("SYSTEM", f"Ollama finished in {time.time() - t0:.2f}s (model {model}).")
-
-            answer = ensure_natural_opener(answer)
-            if not answer:
-                log_event("ERROR", "Ollama returned an empty response.")
-                set_voice_status("Ollama returned an empty response; listening.")
-                _bot_active.clear()
-                continue
-            with _state_lock:
-                _voice_history.append({"role": "assistant", "content": answer})
-            log_event("BOT", answer)
-            set_voice_status(f"Speaking: {answer}")
-
-            stage = "text-to-speech (Fish Audio)"
-            t0 = time.time()
-            speech_path = make_speech(answer, voice)
-            log_event("SYSTEM", f"Fish Audio synthesized audio in {time.time() - t0:.2f}s.")
-            # Do not clear an interrupt that arrived during synthesis.
-            if not _interrupt_playback.is_set() and _audio_running.is_set():
-                stage = "playback"
-                play_audio_interruptibly(speech_path)
-            else:
-                log_event("SYSTEM", "Skipped playback: caller spoke during synthesis.")
-            set_voice_status("Listening for customer...")
-        except requests.RequestException as exc:
-            set_voice_status(f"Ollama connection error: {exc}")
-            log_event("ERROR", f"Ollama connection error: {exc}")
+            def response_job(h=history, t=transcript, m=model, v=voice, p=prompt, g=generation, c=cancel_event):
+                global _first_intro_played
+                try:
+                    if PLAY_FIRST_INTRODUCTION and not _first_intro_played and not c.is_set():
+                        _first_intro_played = True
+                        set_voice_status("Playing first-call introduction...")
+                        intro_path = make_speech(FIRST_INTRODUCTION, v, apply_opener=False, cache=True)
+                        play_audio_interruptibly(intro_path, generation=g, cancel_event=c)
+                        if not c.is_set():
+                            log_event("BOT", FIRST_INTRODUCTION)
+                    if c.is_set():
+                        return
+                    set_voice_status("Streaming response sentence-by-sentence...")
+                    run_response_pipeline(h, t, m, v, p, g, c)
+                    if not c.is_set() and _audio_running.is_set():
+                        set_voice_status("Listening for customer...")
+                except Exception as exc:
+                    set_voice_status(f"Voice pipeline error: {exc}")
+                    log_event("ERROR", f"Streaming voice pipeline error: {exc}")
+                finally:
+                    with _response_state_lock:
+                        if g == _response_generation:
+                            _bot_active.clear()
+            threading.Thread(target=response_job, daemon=True).start()
         except Exception as exc:
-            set_voice_status(f"Voice pipeline error ({stage}): {exc}")
-            log_event("ERROR", f"Pipeline error during {stage}: {exc}")
-        finally:
-            _bot_active.clear()
+            set_voice_status(f"Voice pipeline error (transcription): {exc}")
+            log_event("ERROR", f"Customer turn processing error: {exc}")
+            _pause_playback.clear()
 
 
 def start_voice_mode(input_label, output_label, model, voice, system_prompt, barge_threshold, confirmation_frames):
@@ -1072,6 +1227,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
                 break
         _interrupt_playback.clear()
         _cancel_response.clear()
+        _pause_playback.clear()
         _bot_active.clear()
         _metrics.update(
             rms_now=0.0, vad_now=0.0, vad_true_frames=0, rms_peak_recent=0.0, rms_peak_session=0.0,
@@ -1097,7 +1253,7 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
         set_voice_status("Listening for customer...")
         return (
             f"Voice mode running. Input: {input_info['name']} | Output: {output_info['name']}. "
-            "Customer speech interrupts AI playback."
+            "Customer speech pauses AI playback; acknowledgments resume, new questions replace the old response."
         )
     except Exception as exc:
         _audio_running.clear()
@@ -1115,6 +1271,10 @@ def start_voice_mode(input_label, output_label, model, voice, system_prompt, bar
 def stop_voice_mode():
     global _audio_stream
     _audio_running.clear()
+    _pause_playback.clear()
+    with _response_state_lock:
+        if _active_response_cancel is not None:
+            _active_response_cancel.set()
     stop_playback()
     try:
         if _audio_stream is not None:
@@ -1160,7 +1320,32 @@ def send_message(message, history, model, voice, system_prompt):
 
 
 def clear_conversation():
+    """Clear the visible text-chat conversation only."""
     return "", [], None, "Conversation cleared."
+
+
+def clear_context():
+    """Forget model conversation context for text and voice, without erasing diagnostics."""
+    global _response_generation, _active_response_cancel, _voice_history
+
+    # Invalidate/cancel any in-flight voice response so it cannot keep speaking
+    # or append an answer based on the context that was just cleared.
+    with _response_state_lock:
+        _response_generation += 1
+        active_cancel = _active_response_cancel
+        _active_response_cancel = None
+        if active_cancel is not None:
+            active_cancel.set()
+
+    _cancel_response.set()
+    _interrupt_playback.set()
+    _pause_playback.clear()
+    with _state_lock:
+        _voice_history = []
+
+    log_event("SYSTEM", "Conversation context cleared; diagnostic transcript retained.")
+    set_voice_status("Context cleared. Ready for a new conversation.")
+    return "", [], None, "Context cleared. Voice and text-chat context reset; diagnostic transcript retained."
 
 
 def test_fish(voice):
@@ -1357,11 +1542,13 @@ with gr.Blocks(title="Local Text + Voice AI Test", theme=gr.themes.Soft(), css=N
         with gr.Row():
             send_button = gr.Button("Send", variant="primary")
             clear_button = gr.Button("Clear conversation")
+            clear_context_button = gr.Button("Clear context", variant="stop")
         audio_output = gr.Audio(label="Generated speech", type="filepath", autoplay=False)
         text_status = gr.Textbox(label="Status", value="Ready", interactive=False)
         send_button.click(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
         message_box.submit(send_message, inputs=[message_box, chatbot, model_box, voice_box, system_prompt_box], outputs=[message_box, chatbot, audio_output, text_status])
         clear_button.click(clear_conversation, outputs=[message_box, chatbot, audio_output, text_status])
+        clear_context_button.click(clear_context, outputs=[message_box, chatbot, audio_output, text_status])
 
     with gr.Accordion("Diagnostics", open=False):
         test_button = gr.Button("Test Ollama connection")
